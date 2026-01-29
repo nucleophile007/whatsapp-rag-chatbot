@@ -1,0 +1,74 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+logs/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+.eggs/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Docker
+*.pid
+*.seed
+*.pid.lock
+docker-compose.override.yml
+
+# Project specific
+*.pdf
+rulebook.pdf
+
+# WhatsApp sessions (sensitive data)
+sessions/
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+
+# n8n data (if persisted locally)
+n8n_data/
+
+# Qdrant storage (if persisted locally)
+qdrant_storage/
+
+# Temporary files
+*.tmp
+*.bak
+*.old
+
+# RAG temporary data
+rag/
