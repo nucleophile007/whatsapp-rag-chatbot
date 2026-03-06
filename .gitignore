@@ -69,6 +69,7 @@ qdrant_storage/
 *.tmp
 *.bak
 *.old
+*.md
 
 # RAG temporary data
 rag/
