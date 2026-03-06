@@ -39,6 +39,26 @@ CREATE TABLE knowledge_bases (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Client API keys for public chat endpoint
+CREATE TABLE client_api_keys (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name VARCHAR(120) UNIQUE NOT NULL,
+    description TEXT,
+    key_hash VARCHAR(128) UNIQUE NOT NULL,
+    key_prefix VARCHAR(24) NOT NULL,
+    allow_all_collections BOOLEAN DEFAULT false,
+    allowed_collections JSONB DEFAULT '[]'::jsonb NOT NULL,
+    default_collection_name VARCHAR(255),
+    daily_limit_per_device INTEGER,
+    default_system_prompt TEXT,
+    default_user_prompt_template TEXT,
+    default_prompt_technique VARCHAR(40) DEFAULT 'balanced',
+    is_active BOOLEAN DEFAULT true,
+    last_used_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 -- Workspaces (Unified configuration)
 CREATE TABLE workspaces (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -63,6 +83,8 @@ CREATE TABLE workspace_groups (
 
 CREATE INDEX idx_workspace_groups_workspace_id ON workspace_groups(workspace_id);
 CREATE INDEX idx_workspace_groups_group_id ON workspace_groups(group_id);
+CREATE INDEX idx_client_api_keys_active ON client_api_keys(is_active);
+CREATE INDEX idx_client_api_keys_name ON client_api_keys(name);
 
 -- Add update trigger for new tables
 CREATE TRIGGER update_knowledge_bases_updated_at BEFORE UPDATE ON knowledge_bases
@@ -99,6 +121,16 @@ CREATE TABLE flows (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_executed_at TIMESTAMP
+);
+
+-- Workspace-Flow associations (many-to-many)
+CREATE TABLE workspace_flows (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    workspace_id UUID REFERENCES workspaces(id) ON DELETE CASCADE,
+    flow_id UUID REFERENCES flows(id) ON DELETE CASCADE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    UNIQUE(workspace_id, flow_id)
 );
 
 -- Flow-Group associations (many-to-many)
@@ -160,6 +192,8 @@ CREATE TABLE node_types (
 CREATE INDEX idx_flows_user_id ON flows(user_id);
 CREATE INDEX idx_flows_enabled ON flows(is_enabled);
 CREATE INDEX idx_flows_trigger_type ON flows(trigger_type);
+CREATE INDEX idx_workspace_flows_workspace_id ON workspace_flows(workspace_id);
+CREATE INDEX idx_workspace_flows_flow_id ON workspace_flows(flow_id);
 
 CREATE INDEX idx_whatsapp_groups_enabled ON whatsapp_groups(is_enabled);
 CREATE INDEX idx_whatsapp_groups_chat_id ON whatsapp_groups(chat_id);
@@ -187,6 +221,9 @@ CREATE TRIGGER update_flows_updated_at BEFORE UPDATE ON flows
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 CREATE TRIGGER update_whatsapp_groups_updated_at BEFORE UPDATE ON whatsapp_groups
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_client_api_keys_updated_at BEFORE UPDATE ON client_api_keys
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 -- Insert default node types

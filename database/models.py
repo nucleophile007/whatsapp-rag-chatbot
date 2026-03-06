@@ -68,6 +68,33 @@ class KnowledgeBase(Base):
     updated_at = Column(TIMESTAMP, server_default=func.current_timestamp(), onupdate=func.current_timestamp())
 
 
+class ClientApiKey(Base):
+    """Tenant API keys for public client chat endpoint."""
+    __tablename__ = "client_api_keys"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(String(120), unique=True, nullable=False)
+    description = Column(Text)
+    key_hash = Column(String(128), unique=True, nullable=False)
+    key_prefix = Column(String(24), nullable=False)
+    allow_all_collections = Column(Boolean, default=False)
+    allowed_collections = Column(JSONB, default=list, nullable=False)
+    default_collection_name = Column(String(255))
+    daily_limit_per_device = Column(Integer)
+    default_system_prompt = Column(Text)
+    default_user_prompt_template = Column(Text)
+    default_prompt_technique = Column(String(40), default="balanced")
+    is_active = Column(Boolean, default=True)
+    last_used_at = Column(TIMESTAMP)
+    created_at = Column(TIMESTAMP, server_default=func.current_timestamp())
+    updated_at = Column(TIMESTAMP, server_default=func.current_timestamp(), onupdate=func.current_timestamp())
+
+    __table_args__ = (
+        Index('idx_client_api_keys_active', 'is_active'),
+        Index('idx_client_api_keys_name', 'name'),
+    )
+
+
 class Workspace(Base):
     """Unified configuration for prompts and Knowledge Base assignment"""
     __tablename__ = "workspaces"
@@ -87,6 +114,7 @@ class Workspace(Base):
     knowledge_base = relationship("KnowledgeBase")
     workspace_groups = relationship("WorkspaceGroup", back_populates="workspace", cascade="all, delete-orphan")
     flows = relationship("Flow", back_populates="workspace", cascade="all, delete-orphan")
+    workspace_flows = relationship("WorkspaceFlow", back_populates="workspace", cascade="all, delete-orphan")
 
 
 class WorkspaceGroup(Base):
@@ -106,6 +134,25 @@ class WorkspaceGroup(Base):
         UniqueConstraint('workspace_id', 'group_id', name='uq_workspace_group'),
         Index('idx_workspace_groups_workspace_id', 'workspace_id'),
         Index('idx_workspace_groups_group_id', 'group_id'),
+    )
+
+
+class WorkspaceFlow(Base):
+    """Mapping between Workspaces and Flows (Many-to-Many)"""
+    __tablename__ = "workspace_flows"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id = Column(UUID(as_uuid=True), ForeignKey('workspaces.id', ondelete='CASCADE'))
+    flow_id = Column(UUID(as_uuid=True), ForeignKey('flows.id', ondelete='CASCADE'))
+    created_at = Column(TIMESTAMP, server_default=func.current_timestamp())
+
+    workspace = relationship("Workspace", back_populates="workspace_flows")
+    flow = relationship("Flow", back_populates="workspace_flows")
+
+    __table_args__ = (
+        UniqueConstraint('workspace_id', 'flow_id', name='uq_workspace_flow'),
+        Index('idx_workspace_flows_workspace_id', 'workspace_id'),
+        Index('idx_workspace_flows_flow_id', 'flow_id'),
     )
 
 
@@ -141,6 +188,7 @@ class Flow(Base):
     # Relationships
     user = relationship("User", back_populates="flows")
     workspace = relationship("Workspace", back_populates="flows")
+    workspace_flows = relationship("WorkspaceFlow", back_populates="flow", cascade="all, delete-orphan")
     flow_groups = relationship("FlowGroup", back_populates="flow", cascade="all, delete-orphan")
     executions = relationship("FlowExecution", back_populates="flow", cascade="all, delete-orphan")
     

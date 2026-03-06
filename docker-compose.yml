@@ -99,6 +99,12 @@ services:
       - WAHA_URL=http://waha:3000
       - WAHA_API_KEY=Yahoo
       - DATABASE_URL=postgresql://flowbuilder:flowbuilder123@postgres:5432/whatsapp_flows
+      - RQ_WORKER_DEFAULT_COUNT=1
+      - RQ_WORKER_MIN_COUNT=1
+      - RQ_WORKER_MAX_COUNT=16
+      - RQ_WORKER_DESIRED_KEY=rq:workers:desired_count
+      - RQ_WORKER_MANAGER_HEARTBEAT_KEY=rq:workers:manager:heartbeat
+      - RQ_WORKER_MANAGER_HEARTBEAT_TTL_SECONDS=15
     env_file:
       - .env
     volumes:
@@ -110,7 +116,7 @@ services:
       - postgres
     networks:
       - async_rag_network
-    command: rq worker --with-scheduler
+    command: python queues/worker_pool_manager.py
 
   waha:
     image: devlikeapro/waha:latest
@@ -138,5 +144,4 @@ networks:
 volumes:
   qdrant_storage:
   postgres_data:
-
 

@@ -1,8 +1,12 @@
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
 @import "tailwindcss";
 
 @config "../tailwind.config.js";
 
 @theme {
+  --font-heading: 'Space Grotesk', sans-serif;
+  --font-body: 'IBM Plex Sans', sans-serif;
+
   --color-border: hsl(var(--border));
   --color-input: hsl(var(--input));
   --color-ring: hsl(var(--ring));
@@ -37,57 +41,157 @@
 
 @layer base {
   :root {
-    --background: 0 0% 100%;
-    --foreground: 222.2 84% 4.9%;
+    --background: 45 33% 98%;
+    --foreground: 210 36% 16%;
     --card: 0 0% 100%;
-    --card-foreground: 222.2 84% 4.9%;
+    --card-foreground: 210 36% 16%;
     --popover: 0 0% 100%;
-    --popover-foreground: 222.2 84% 4.9%;
-    --primary: 222.2 47.4% 11.2%;
-    --primary-foreground: 210 40% 98%;
-    --secondary: 210 40% 96.1%;
-    --secondary-foreground: 222.2 47.4% 11.2%;
-    --muted: 210 40% 96.1%;
-    --muted-foreground: 215.4 16.3% 46.9%;
-    --accent: 210 40% 96.1%;
-    --accent-foreground: 222.2 47.4% 11.2%;
-    --destructive: 0 84.2% 60.2%;
-    --destructive-foreground: 210 40% 98%;
-    --border: 214.3 31.8% 91.4%;
-    --input: 214.3 31.8% 91.4%;
-    --ring: 222.2 84% 4.9%;
-    --radius: 0.5rem;
+    --popover-foreground: 210 36% 16%;
+    --primary: 198 88% 34%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 186 31% 94%;
+    --secondary-foreground: 210 36% 16%;
+    --muted: 190 20% 94%;
+    --muted-foreground: 210 12% 40%;
+    --accent: 26 82% 90%;
+    --accent-foreground: 210 36% 16%;
+    --destructive: 0 71% 53%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 190 18% 84%;
+    --input: 190 18% 84%;
+    --ring: 198 88% 34%;
+    --radius: 0.9rem;
   }
 
-  .dark {
-    --background: 222.2 84% 4.9%;
-    --foreground: 210 40% 98%;
-    --card: 222.2 84% 4.9%;
-    --card-foreground: 210 40% 98%;
-    --popover: 222.2 84% 4.9%;
-    --popover-foreground: 210 40% 98%;
-    --primary: 210 40% 98%;
-    --primary-foreground: 222.2 47.4% 11.2%;
-    --secondary: 217.2 32.6% 17.5%;
-    --secondary-foreground: 210 40% 98%;
-    --muted: 217.2 32.6% 17.5%;
-    --muted-foreground: 215 20.2% 65.1%;
-    --accent: 217.2 32.6% 17.5%;
-    --accent-foreground: 210 40% 98%;
-    --destructive: 0 62.8% 30.6%;
-    --destructive-foreground: 210 40% 98%;
-    --border: 217.2 32.6% 17.5%;
-    --input: 217.2 32.6% 17.5%;
-    --ring: 212.7 26.8% 83.9%;
-  }
-}
-
-@layer base {
   * {
     @apply border-border;
   }
 
+  html,
+  body,
+  #root {
+    min-height: 100%;
+  }
+
   body {
-    @apply bg-background text-foreground;
+    font-family: var(--font-body);
+    @apply bg-background text-foreground antialiased;
+    background-image:
+      radial-gradient(circle at 18% 12%, rgba(22, 163, 181, 0.14) 0, transparent 36%),
+      radial-gradient(circle at 82% 0%, rgba(251, 146, 60, 0.15) 0, transparent 28%),
+      linear-gradient(180deg, rgba(255, 255, 255, 0.95), rgba(247, 248, 244, 0.9));
+    background-attachment: fixed;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4,
+  h5,
+  h6 {
+    font-family: var(--font-heading);
+    letter-spacing: -0.02em;
+  }
+
+  a:focus-visible,
+  button:focus-visible,
+  input:focus-visible,
+  select:focus-visible,
+  textarea:focus-visible {
+    outline: 2px solid hsl(var(--ring));
+    outline-offset: 2px;
+  }
+}
+
+@layer components {
+  .app-shell {
+    @apply rounded-[24px] border bg-white/75 backdrop-blur-xl shadow-[0_10px_40px_-20px_rgba(15,23,42,0.45)];
+  }
+
+  .panel {
+    @apply rounded-2xl border bg-white/80 backdrop-blur-sm shadow-sm;
+  }
+
+  .panel-muted {
+    @apply rounded-2xl border border-dashed bg-white/45 backdrop-blur-sm;
+  }
+
+  .page-header {
+    @apply flex flex-col gap-2;
+  }
+
+  .title-xl {
+    @apply text-3xl md:text-4xl font-bold;
+  }
+
+  .subtitle {
+    @apply text-sm md:text-base text-muted-foreground;
+  }
+
+  .btn-primary {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl bg-primary px-4 py-2.5 text-primary-foreground font-semibold transition-transform hover:-translate-y-0.5 active:translate-y-0 disabled:opacity-50;
+  }
+
+  .btn-secondary {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl border bg-white px-4 py-2.5 text-sm font-semibold text-foreground transition-colors hover:bg-secondary;
+  }
+
+  .tag {
+    @apply inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-[11px] font-semibold;
+  }
+
+  .input-base {
+    @apply w-full rounded-xl border bg-white px-3.5 py-2.5 text-sm outline-none focus:ring-2 focus:ring-primary/25;
+  }
+}
+
+@layer utilities {
+  .soft-grid {
+    background-image:
+      linear-gradient(rgba(15, 23, 42, 0.03) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(15, 23, 42, 0.03) 1px, transparent 1px);
+    background-size: 20px 20px;
+  }
+
+  .animate-rise {
+    animation: rise 450ms ease-out both;
+  }
+
+  .animate-float {
+    animation: float 3.8s ease-in-out infinite;
+  }
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes float {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+
+  50% {
+    transform: translateY(-5px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
   }
 }

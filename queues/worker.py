@@ -2,6 +2,8 @@ import os
 import warnings
 import requests
 import json  # Add json import
+import re
+from typing import Dict, Optional
 
 # Fix macOS fork() crash with Objective-C runtime
 os.environ['OBJC_DISABLE_INITIALIZE_FORK_SAFETY'] = 'YES'
@@ -23,12 +25,26 @@ embedding_model = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-00
 
 # Use environment variable for Qdrant URL (Docker compatibility)
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
+DEFAULT_QDRANT_COLLECTION = os.getenv("DEFAULT_QDRANT_COLLECTION", "").strip()
 
-vector_db=QdrantVectorStore.from_existing_collection(
-       embedding=embedding_model,
-    url=QDRANT_URL,
-    collection_name="hehe huhu"
-)
+_vector_db_cache: Dict[str, QdrantVectorStore] = {}
+
+
+def _get_vector_db(collection_name: str) -> QdrantVectorStore:
+    if collection_name in _vector_db_cache:
+        return _vector_db_cache[collection_name]
+
+    try:
+        vector_db = QdrantVectorStore.from_existing_collection(
+            embedding=embedding_model,
+            url=QDRANT_URL,
+            collection_name=collection_name,
+        )
+    except Exception as e:
+        raise ValueError(f"Qdrant collection '{collection_name}' load nahi ho payi: {e}") from e
+
+    _vector_db_cache[collection_name] = vector_db
+    return vector_db
 
 
 def send_websocket_notification(client_id: str, result: str, job_id: str = None):
@@ -95,11 +111,48 @@ def send_whatsapp_reply(client_id: str, result: str, whatsapp_message_id: str = 
         print(f"❌ Failed to send WhatsApp reply: {e}")
 
 
+def process_query(
+    query: str,
+    client_id: str = None,
+    conversation_history: str = "",
+    whatsapp_message_id: str = None,
+    collection_name: str = None,
+    system_prompt: Optional[str] = None,
+    user_prompt_template: Optional[str] = None,
+    emit_side_effects: bool = True,
+):
+    capability_query = bool(
+        re.search(
+            r"\b(what\s+(knowledge|information|info)\s+(do\s+you\s+have|you\s+have|you\s+provide)|"
+            r"what\s+can\s+you\s+(answer|provide|do)|"
+            r"what\s+do\s+you\s+know|"
+            r"which\s+topics)\b",
+            query.lower(),
+        )
+    )
 
-def process_query(query: str, client_id: str = None, conversation_history: str = "", whatsapp_message_id: str = None):
-    print("searching chunks:", query)
-    search_results = vector_db.similarity_search(query=query)
-    context = "\n\n\n".join([f"Page Content: {result.page_content}\nPage Number: {result.metadata['page_label']}\nFile Location: {result.metadata['source']}" for result in search_results])
+    target_collection = (collection_name or DEFAULT_QDRANT_COLLECTION or "").strip()
+    if not target_collection:
+        raise ValueError("RAG ke liye collection_name missing hai. Workspace KB ya flow config check karo.")
+
+    retrieval_query = query
+    retrieval_k = 5
+    if capability_query:
+        # For "what can you answer" style queries, fetch broad KB overview chunks.
+        retrieval_query = "table of contents topics sections syllabus overview departments course codes"
+        retrieval_k = 8
+
+    print(f"searching chunks in '{target_collection}':", retrieval_query)
+    vector_db = _get_vector_db(target_collection)
+    search_results = vector_db.similarity_search(query=retrieval_query, k=retrieval_k)
+    context = "\n\n\n".join([
+        (
+            f"Page Content: {result.page_content}\n"
+            f"Page Number: {result.metadata.get('page_label', result.metadata.get('page', 'N/A'))}\n"
+            f"File Location: {result.metadata.get('source', 'N/A')}"
+        )
+        for result in search_results
+    ])
 
     # Build system prompt with conversation history if available
     conversation_context = ""
@@ -111,42 +164,68 @@ Previous Conversation:
 The user may be asking a follow-up question. Use the conversation history to understand the context and provide a more relevant answer.
 """
 
-    SYSTEM_PROMPT = f"""
+    default_system_prompt = f"""
     You are a helpful AI Assistant who answers user queries based on the available context retrieved from a PDF file along with page_contents and page number.
 
     You should only answer the user based on the following context and navigate the user to open the right page number to know more.
+    If recent conversation contains explicit user-defined mappings (for example: "cs means computer science"),
+    you may use those mappings to interpret follow-up questions before answering from PDF context.
     
     {conversation_context}
 
-    Context from PDF:
-    {context}
-    """
+Context from PDF:
+{context}
+"""
+
+    replacements = {
+        "{{body}}": query,
+        "{{query}}": query,
+        "{{rag_result}}": context,
+        "{{context}}": context,
+        "{{conversation_history}}": conversation_history or "",
+        "{{retrieval_query}}": retrieval_query,
+        "{{is_capability_query}}": "true" if capability_query else "false",
+    }
+
+    effective_system_prompt = (system_prompt or "").strip() or default_system_prompt
+    for key, value in replacements.items():
+        effective_system_prompt = effective_system_prompt.replace(key, value)
+
+    user_contents = query
+    if (user_prompt_template or "").strip():
+        user_contents = user_prompt_template
+        for key, value in replacements.items():
+            user_contents = user_contents.replace(key, value)
+        user_contents = user_contents.strip() or query
 
     client = genai.Client()
 
 
     response = client.models.generate_content(
         model="gemini-2.5-flash", # Use a suitable model
-        contents=query,
+        contents=user_contents,
         config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
+            system_instruction=effective_system_prompt,
             # Optional: You can also set other parameters here, like temperature
             # temperature=0.7, 
         ),
     )
-    print(response.text)
+    response_text = response.text or ""
+
+    print(response_text)
     
     # Get job_id from RQ context if available
     from rq import get_current_job
     job = get_current_job()
     job_id = job.id if job else None
     
-    # Send WebSocket notification if client_id is provided
-    if client_id:
-        send_websocket_notification(client_id, response.text, job_id)
+    # Optional side effects (websocket + direct WhatsApp send) are used by /chat path.
+    # Flow engine callers can disable this and use explicit send nodes instead.
+    if emit_side_effects and client_id:
+        send_websocket_notification(client_id, response_text, job_id)
     
     # Send WhatsApp reply if it's a WhatsApp message
-    if client_id and "@g.us" in client_id:
-        send_whatsapp_reply(client_id, response.text, whatsapp_message_id)
+    if emit_side_effects and client_id and "@g.us" in client_id:
+        send_whatsapp_reply(client_id, response_text, whatsapp_message_id)
     
-    return response.text
+    return response_text

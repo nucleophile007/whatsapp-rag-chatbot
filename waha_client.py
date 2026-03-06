@@ -4,7 +4,7 @@ WAHA API Client for WhatsApp operations
 
 import os
 import requests
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import logging
 
 logger = logging.getLogger(__name__)
@@ -30,6 +30,12 @@ class WAHAClient:
         except requests.exceptions.RequestException as e:
             logger.error(f"WAHA API mein gadbad: {e}")
             return None
+
+    def send_payload(self, method: str, endpoint: str, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Generic WAHA request for message-style endpoints."""
+        data = dict(payload)
+        data.setdefault("session", self.session_name)
+        return self._make_request(method, endpoint, json=data)
     
     def get_all_groups(self) -> List[Dict[str, Any]]:
         """Saare WhatsApp groups nikaalo"""
@@ -82,8 +88,8 @@ class WAHAClient:
         }
         if reply_to:
             payload["reply_to"] = reply_to
-        
-        result = self._make_request("POST", "/api/sendText", json=payload)
+
+        result = self.send_payload("POST", "/api/sendText", payload)
         if result:
             logger.info(f"✅ Message chala gaya: {chat_id}")
             return True
@@ -98,6 +104,32 @@ class WAHAClient:
         }
         result = self._make_request("POST", "/api/forwardMessage", json=payload)
         return bool(result)
+
+    def send_dynamic_message(self, message_type: str, payload: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+        """
+        Send WAHA message with dynamic endpoint selection.
+        Returns (success, response_or_error_payload).
+        """
+        endpoint_map = {
+            "text": ("POST", "/api/sendText"),
+            "image": ("POST", "/api/sendImage"),
+            "file": ("POST", "/api/sendFile"),
+            "voice": ("POST", "/api/sendVoice"),
+            "video": ("POST", "/api/sendVideo"),
+            "location": ("POST", "/api/sendLocation"),
+            "poll": ("POST", "/api/sendPoll"),
+            "poll_vote": ("POST", "/api/sendPollVote"),
+            "forward": ("POST", "/api/forwardMessage"),
+            "reaction": ("PUT", "/api/reaction"),
+            "buttons": ("POST", "/api/sendButtons"),
+        }
+
+        key = (message_type or "text").strip().lower()
+        method, endpoint = endpoint_map.get(key, endpoint_map["text"])
+        result = self.send_payload(method, endpoint, payload)
+        if result is None:
+            return False, {"error": "waha_request_failed", "method": method, "endpoint": endpoint}
+        return True, result
     
     def get_session_status(self) -> Dict[str, Any]:
         """Session ka status check karo (Connected hai ya nahi)"""
