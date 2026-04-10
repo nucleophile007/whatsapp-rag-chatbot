@@ -42,6 +42,7 @@ export const DEFAULT_NODES: Record<string, FlowNodeData> = {
       mention_specific_jids: "",
       mention_match_text_aliases: true,
       mention_text_aliases: "",
+      mention_match_plain_message: false,
     },
   },
   [NODE_TYPES.TRIGGER.SCHEDULE]: {
@@ -59,6 +60,10 @@ export const DEFAULT_NODES: Record<string, FlowNodeData> = {
       query: "{{trigger.body}}",
       include_conversation_history: true,
       context_limit: "5",
+      grounding_threshold: "0.46",
+      final_context_k: "8",
+      retrieval_candidates: "22",
+      require_citations: false,
     },
   },
   [NODE_TYPES.ACTION.SEND_MESSAGE]: {

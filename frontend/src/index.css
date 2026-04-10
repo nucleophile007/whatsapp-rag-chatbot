@@ -76,11 +76,7 @@
   body {
     font-family: var(--font-body);
     @apply bg-background text-foreground antialiased;
-    background-image:
-      radial-gradient(circle at 18% 12%, rgba(22, 163, 181, 0.14) 0, transparent 36%),
-      radial-gradient(circle at 82% 0%, rgba(251, 146, 60, 0.15) 0, transparent 28%),
-      linear-gradient(180deg, rgba(255, 255, 255, 0.95), rgba(247, 248, 244, 0.9));
-    background-attachment: fixed;
+    background: linear-gradient(180deg, #fcfdfb 0%, #f7faf8 100%);
   }
 
   h1,
@@ -105,15 +101,15 @@
 
 @layer components {
   .app-shell {
-    @apply rounded-[24px] border bg-white/75 backdrop-blur-xl shadow-[0_10px_40px_-20px_rgba(15,23,42,0.45)];
+    @apply rounded-[20px] border bg-white shadow-sm;
   }
 
   .panel {
-    @apply rounded-2xl border bg-white/80 backdrop-blur-sm shadow-sm;
+    @apply rounded-2xl border bg-white shadow-sm;
   }
 
   .panel-muted {
-    @apply rounded-2xl border border-dashed bg-white/45 backdrop-blur-sm;
+    @apply rounded-2xl border border-dashed bg-white;
   }
 
   .page-header {
@@ -129,7 +125,7 @@
   }
 
   .btn-primary {
-    @apply inline-flex items-center justify-center gap-2 rounded-xl bg-primary px-4 py-2.5 text-primary-foreground font-semibold transition-transform hover:-translate-y-0.5 active:translate-y-0 disabled:opacity-50;
+    @apply inline-flex items-center justify-center gap-2 rounded-xl bg-primary px-4 py-2.5 text-primary-foreground font-semibold transition-colors hover:opacity-90 disabled:opacity-50;
   }
 
   .btn-secondary {
@@ -154,11 +150,11 @@
   }
 
   .animate-rise {
-    animation: rise 450ms ease-out both;
+    animation: rise 220ms ease-out both;
   }
 
   .animate-float {
-    animation: float 3.8s ease-in-out infinite;
+    animation: none;
   }
 }
 

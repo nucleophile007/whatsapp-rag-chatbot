@@ -1,13 +1,14 @@
 import type {
   ApiStatusMessage,
-  ClientApiKeyDeleteResponse,
-  ClientApiKeyMutationResponse,
-  ClientApiKeyRecord,
-  ClientApiKeysResponse,
+  Contact,
+  ContactsResponse,
   Collection,
   CollectionRecord,
   CollectionsResponse,
   DeleteFlowResponse,
+  ExecutionBulkDeleteResponse,
+  ExecutionClearResponse,
+  ExecutionDeleteResponse,
   ExecutionRecord,
   ExecutionsResponse,
   FlowDefinition,
@@ -18,15 +19,23 @@ import type {
   FlowTemplate,
   Group,
   GroupsResponse,
+  MemoryHistoryMessage,
+  MemoryLtmItem,
+  MemoryLtmMutationResponse,
+  MemorySnapshotResponse,
   SyncCollectionsResponse,
+  SyncContactsResponse,
   SyncGroupsResponse,
   TemplatesResponse,
   TestFlowResponse,
   ToggleGroupResponse,
   ToggleWorkspaceResponse,
-  ClientChatDocsResponse,
-  ClientChatResponse,
   UploadDocumentsResponse,
+  UploadJobStartResponse,
+  UploadJobStatusResponse,
+  RagEvalResponse,
+  RetrievalProfile,
+  RetrievalProfileResponse,
   WorkspaceDetailResponse,
   WorkspaceGroupRef,
   WorkspaceRecord,
@@ -130,6 +139,46 @@ function parseGroup(value: unknown, path: string): Group {
   };
 }
 
+function parseContact(value: unknown, path: string): Contact {
+  const record = asRecord(value, path);
+  return {
+    id: asString(pick(record, "id", path), `${path}.id`),
+    chat_id: asString(pick(record, "chat_id", path), `${path}.chat_id`),
+    display_name:
+      "display_name" in record
+        ? asStringOrNull(pick(record, "display_name", path), `${path}.display_name`)
+        : null,
+    phone_number:
+      "phone_number" in record
+        ? asStringOrNull(pick(record, "phone_number", path), `${path}.phone_number`)
+        : null,
+    waha_contact_id:
+      "waha_contact_id" in record
+        ? asStringOrNull(pick(record, "waha_contact_id", path), `${path}.waha_contact_id`)
+        : null,
+    lid:
+      "lid" in record
+        ? asStringOrNull(pick(record, "lid", path), `${path}.lid`)
+        : null,
+    phone_jid:
+      "phone_jid" in record
+        ? asStringOrNull(pick(record, "phone_jid", path), `${path}.phone_jid`)
+        : null,
+    source:
+      "source" in record
+        ? asString(pick(record, "source", path), `${path}.source`)
+        : "webhook",
+    is_active:
+      "is_active" in record
+        ? asBoolean(pick(record, "is_active", path), `${path}.is_active`)
+        : true,
+    last_seen_at:
+      "last_seen_at" in record
+        ? asStringOrNull(pick(record, "last_seen_at", path), `${path}.last_seen_at`)
+        : null,
+  };
+}
+
 function parseWorkspaceGroupRef(value: unknown, path: string): WorkspaceGroupRef {
   const record = asRecord(value, path);
   return {
@@ -146,6 +195,74 @@ function parseCollection(value: unknown, path: string): Collection {
     name: asString(pick(record, "name", path), `${path}.name`),
     description: asStringOrNull(pick(record, "description", path), `${path}.description`),
     created_at: asString(pick(record, "created_at", path), `${path}.created_at`),
+    retrieval_profile:
+      "retrieval_profile" in record
+        ? parseRetrievalProfile(
+            pick(record, "retrieval_profile", path),
+            `${path}.retrieval_profile`
+          )
+        : emptyRetrievalProfile(),
+  };
+}
+
+function parseNumberOrNull(value: unknown, path: string): number | null {
+  if (value === null) return null;
+  return asNumber(value, path);
+}
+
+function parseBooleanOrNull(value: unknown, path: string): boolean | null {
+  if (value === null) return null;
+  return asBoolean(value, path);
+}
+
+function parseRetrievalProfile(value: unknown, path: string): RetrievalProfile {
+  const record = asRecord(value, path);
+  return {
+    final_context_k: parseNumberOrNull(pick(record, "final_context_k", path), `${path}.final_context_k`),
+    retrieval_candidates: parseNumberOrNull(
+      pick(record, "retrieval_candidates", path),
+      `${path}.retrieval_candidates`
+    ),
+    grounding_threshold: parseNumberOrNull(
+      pick(record, "grounding_threshold", path),
+      `${path}.grounding_threshold`
+    ),
+    require_citations: parseBooleanOrNull(
+      pick(record, "require_citations", path),
+      `${path}.require_citations`
+    ),
+    min_context_chars: parseNumberOrNull(pick(record, "min_context_chars", path), `${path}.min_context_chars`),
+    query_variants_limit: parseNumberOrNull(
+      pick(record, "query_variants_limit", path),
+      `${path}.query_variants_limit`
+    ),
+    clarification_enabled: parseBooleanOrNull(
+      pick(record, "clarification_enabled", path),
+      `${path}.clarification_enabled`
+    ),
+    clarification_threshold: parseNumberOrNull(
+      pick(record, "clarification_threshold", path),
+      `${path}.clarification_threshold`
+    ),
+    chunk_size: parseNumberOrNull(pick(record, "chunk_size", path), `${path}.chunk_size`),
+    chunk_overlap: parseNumberOrNull(pick(record, "chunk_overlap", path), `${path}.chunk_overlap`),
+    updated_at: asStringOrNull(pick(record, "updated_at", path), `${path}.updated_at`),
+  };
+}
+
+function emptyRetrievalProfile(): RetrievalProfile {
+  return {
+    final_context_k: null,
+    retrieval_candidates: null,
+    grounding_threshold: null,
+    require_citations: null,
+    min_context_chars: null,
+    query_variants_limit: null,
+    clarification_enabled: null,
+    clarification_threshold: null,
+    chunk_size: null,
+    chunk_overlap: null,
+    updated_at: null,
   };
 }
 
@@ -200,6 +317,50 @@ function parseExecutionRecord(value: unknown, path: string): ExecutionRecord {
   };
 }
 
+function parseMemoryHistoryMessage(value: unknown, path: string): MemoryHistoryMessage {
+  const record = asRecord(value, path);
+  return {
+    role: asString(pick(record, "role", path), `${path}.role`),
+    content: asString(pick(record, "content", path), `${path}.content`),
+    timestamp:
+      "timestamp" in record
+        ? asStringOrNull(pick(record, "timestamp", path), `${path}.timestamp`)
+        : null,
+  };
+}
+
+function parseMemoryLtmItem(value: unknown, path: string): MemoryLtmItem {
+  const record = asRecord(value, path);
+  return {
+    memory_key: asString(pick(record, "memory_key", path), `${path}.memory_key`),
+    memory_text: asString(pick(record, "memory_text", path), `${path}.memory_text`),
+    memory_category: asString(pick(record, "memory_category", path), `${path}.memory_category`),
+    confidence: asNumber(pick(record, "confidence", path), `${path}.confidence`),
+    hit_count: asNumber(pick(record, "hit_count", path), `${path}.hit_count`),
+    is_active: asBoolean(pick(record, "is_active", path), `${path}.is_active`),
+    source_message:
+      "source_message" in record
+        ? asStringOrNull(pick(record, "source_message", path), `${path}.source_message`)
+        : null,
+    metadata:
+      "metadata" in record
+        ? (asObjectOrNull(pick(record, "metadata", path), `${path}.metadata`) || {})
+        : {},
+    last_seen_at:
+      "last_seen_at" in record
+        ? asStringOrNull(pick(record, "last_seen_at", path), `${path}.last_seen_at`)
+        : null,
+    updated_at:
+      "updated_at" in record
+        ? asStringOrNull(pick(record, "updated_at", path), `${path}.updated_at`)
+        : null,
+    created_at:
+      "created_at" in record
+        ? asStringOrNull(pick(record, "created_at", path), `${path}.created_at`)
+        : null,
+  };
+}
+
 export function parseGroupsResponse(value: unknown): GroupsResponse {
   const record = asRecord(value, "groupsResponse");
   return {
@@ -224,6 +385,30 @@ export function parseSyncGroupsResponse(value: unknown): SyncGroupsResponse {
   return {
     status: "error",
     message: asString(pick(record, "message", "syncGroupsResponse"), "syncGroupsResponse.message"),
+  };
+}
+
+export function parseContactsResponse(value: unknown): ContactsResponse {
+  const record = asRecord(value, "contactsResponse");
+  return {
+    contacts: asArray(
+      pick(record, "contacts", "contactsResponse"),
+      "contactsResponse.contacts",
+      (item, index) => parseContact(item, `contactsResponse.contacts[${index}]`)
+    ),
+    total:
+      "total" in record
+        ? asNumber(pick(record, "total", "contactsResponse"), "contactsResponse.total")
+        : undefined,
+  };
+}
+
+export function parseSyncContactsResponse(value: unknown): SyncContactsResponse {
+  const record = asRecord(value, "syncContactsResponse");
+  return {
+    status: asString(pick(record, "status", "syncContactsResponse"), "syncContactsResponse.status") as "success",
+    synced: asNumber(pick(record, "synced", "syncContactsResponse"), "syncContactsResponse.synced"),
+    total: asNumber(pick(record, "total", "syncContactsResponse"), "syncContactsResponse.total"),
   };
 }
 
@@ -290,6 +475,27 @@ export function parseUploadDocumentsResponse(value: unknown): UploadDocumentsRes
             pick(record, "url_chunk_count", "uploadDocumentsResponse"),
             "uploadDocumentsResponse.url_chunk_count"
           ),
+    chunk_size_used:
+      pick(record, "chunk_size_used", "uploadDocumentsResponse") == null
+        ? undefined
+        : asNumber(
+            pick(record, "chunk_size_used", "uploadDocumentsResponse"),
+            "uploadDocumentsResponse.chunk_size_used"
+          ),
+    chunk_overlap_used:
+      pick(record, "chunk_overlap_used", "uploadDocumentsResponse") == null
+        ? undefined
+        : asNumber(
+            pick(record, "chunk_overlap_used", "uploadDocumentsResponse"),
+            "uploadDocumentsResponse.chunk_overlap_used"
+          ),
+    ocr_used:
+      pick(record, "ocr_used", "uploadDocumentsResponse") == null
+        ? undefined
+        : asBoolean(
+            pick(record, "ocr_used", "uploadDocumentsResponse"),
+            "uploadDocumentsResponse.ocr_used"
+          ),
     points_count:
       pick(record, "points_count", "uploadDocumentsResponse") == null
         ? undefined
@@ -297,240 +503,281 @@ export function parseUploadDocumentsResponse(value: unknown): UploadDocumentsRes
   };
 }
 
-export function parseClientChatResponse(value: unknown): ClientChatResponse {
-  const record = asRecord(value, "clientChatResponse");
-  const rateLimitRecord = asRecord(
-    pick(record, "rate_limit", "clientChatResponse"),
-    "clientChatResponse.rate_limit"
-  );
+function parseUploadJobBase(record: UnknownRecord, path: string) {
   return {
-    status: asString(pick(record, "status", "clientChatResponse"), "clientChatResponse.status") as "success",
-    reply: asString(pick(record, "reply", "clientChatResponse"), "clientChatResponse.reply"),
-    client_id: asString(pick(record, "client_id", "clientChatResponse"), "clientChatResponse.client_id"),
-    client_id_strategy: asString(
-      pick(record, "client_id_strategy", "clientChatResponse"),
-      "clientChatResponse.client_id_strategy"
-    ),
-    response_mode: asString(
-      pick(record, "response_mode", "clientChatResponse"),
-      "clientChatResponse.response_mode"
-    ) as "direct" | "rag",
-    collection_name: asStringOrNull(
-      pick(record, "collection_name", "clientChatResponse"),
-      "clientChatResponse.collection_name"
-    ),
-    prompt_technique: asString(
-      pick(record, "prompt_technique", "clientChatResponse"),
-      "clientChatResponse.prompt_technique"
-    ) as "balanced" | "concise" | "detailed" | "strict_context" | "socratic",
-    rate_limit: {
-      enabled: asBoolean(
-        pick(rateLimitRecord, "enabled", "clientChatResponse.rate_limit"),
-        "clientChatResponse.rate_limit.enabled"
-      ),
-      limit: asNumber(
-        pick(rateLimitRecord, "limit", "clientChatResponse.rate_limit"),
-        "clientChatResponse.rate_limit.limit"
-      ),
-      used: asNumber(
-        pick(rateLimitRecord, "used", "clientChatResponse.rate_limit"),
-        "clientChatResponse.rate_limit.used"
-      ),
-      remaining:
-        pick(rateLimitRecord, "remaining", "clientChatResponse.rate_limit") == null
-          ? null
-          : asNumber(
-              pick(rateLimitRecord, "remaining", "clientChatResponse.rate_limit"),
-              "clientChatResponse.rate_limit.remaining"
-            ),
-      scope: asString(
-        pick(rateLimitRecord, "scope", "clientChatResponse.rate_limit"),
-        "clientChatResponse.rate_limit.scope"
-      ),
-      reset_at:
-        "reset_at" in rateLimitRecord && rateLimitRecord.reset_at != null
-          ? asString(rateLimitRecord.reset_at, "clientChatResponse.rate_limit.reset_at")
-          : undefined,
-    },
-    model: asString(pick(record, "model", "clientChatResponse"), "clientChatResponse.model"),
-    timestamp: asString(pick(record, "timestamp", "clientChatResponse"), "clientChatResponse.timestamp"),
+    job_id: asString(pick(record, "job_id", path), `${path}.job_id`),
+    kb_name: asString(pick(record, "kb_name", path), `${path}.kb_name`),
+    created_at: asString(pick(record, "created_at", path), `${path}.created_at`),
+    updated_at: asString(pick(record, "updated_at", path), `${path}.updated_at`),
+    phase: asString(pick(record, "phase", path), `${path}.phase`),
+    phase_label: asString(pick(record, "phase_label", path), `${path}.phase_label`),
+    message: asString(pick(record, "message", path), `${path}.message`),
+    progress_percent: asNumber(pick(record, "progress_percent", path), `${path}.progress_percent`),
+    file_count: asNumber(pick(record, "file_count", path), `${path}.file_count`),
+    url_count: asNumber(pick(record, "url_count", path), `${path}.url_count`),
+    chunk_size_used: asNumber(pick(record, "chunk_size_used", path), `${path}.chunk_size_used`),
+    chunk_overlap_used: asNumber(pick(record, "chunk_overlap_used", path), `${path}.chunk_overlap_used`),
+    ocr_used: asBoolean(pick(record, "ocr_used", path), `${path}.ocr_used`),
   };
 }
 
-export function parseClientChatDocsResponse(value: unknown): ClientChatDocsResponse {
-  const record = asRecord(value, "clientChatDocsResponse");
-  const authRecord = asRecord(pick(record, "auth", "clientChatDocsResponse"), "clientChatDocsResponse.auth");
-  const scopeRecord = asRecord(pick(record, "scope", "clientChatDocsResponse"), "clientChatDocsResponse.scope");
-  return {
-    status: asString(pick(record, "status", "clientChatDocsResponse"), "clientChatDocsResponse.status") as "success",
-    base_url: asString(pick(record, "base_url", "clientChatDocsResponse"), "clientChatDocsResponse.base_url"),
-    endpoint: asString(pick(record, "endpoint", "clientChatDocsResponse"), "clientChatDocsResponse.endpoint"),
-    stream_endpoint: asString(
-      pick(record, "stream_endpoint", "clientChatDocsResponse"),
-      "clientChatDocsResponse.stream_endpoint"
-    ),
-    method: asString(pick(record, "method", "clientChatDocsResponse"), "clientChatDocsResponse.method"),
-    active_collection_name: asStringOrNull(
-      pick(record, "active_collection_name", "clientChatDocsResponse"),
-      "clientChatDocsResponse.active_collection_name"
-    ),
-    available_collections: asArray(
-      pick(record, "available_collections", "clientChatDocsResponse"),
-      "clientChatDocsResponse.available_collections",
-      (item, index) => asString(item, `clientChatDocsResponse.available_collections[${index}]`)
-    ),
-    supported_prompt_techniques: asArray(
-      pick(record, "supported_prompt_techniques", "clientChatDocsResponse"),
-      "clientChatDocsResponse.supported_prompt_techniques",
-      (item, index) =>
-        asString(item, `clientChatDocsResponse.supported_prompt_techniques[${index}]`) as
-          | "balanced"
-          | "concise"
-          | "detailed"
-          | "strict_context"
-          | "socratic"
-    ),
-    auth: {
-      header: asString(pick(authRecord, "header", "clientChatDocsResponse.auth"), "clientChatDocsResponse.auth.header"),
-      required: asBoolean(
-        pick(authRecord, "required", "clientChatDocsResponse.auth"),
-        "clientChatDocsResponse.auth.required"
-      ),
-      mode: asString(pick(authRecord, "mode", "clientChatDocsResponse.auth"), "clientChatDocsResponse.auth.mode") as
-        | "open"
-        | "global"
-        | "tenant",
-    },
-    scope: {
-      allow_all_collections: asBoolean(
-        pick(scopeRecord, "allow_all_collections", "clientChatDocsResponse.scope"),
-        "clientChatDocsResponse.scope.allow_all_collections"
-      ),
-      allowed_collections: asArray(
-        pick(scopeRecord, "allowed_collections", "clientChatDocsResponse.scope"),
-        "clientChatDocsResponse.scope.allowed_collections",
-        (item, index) => asString(item, `clientChatDocsResponse.scope.allowed_collections[${index}]`)
-      ),
-      default_collection_name: asStringOrNull(
-        pick(scopeRecord, "default_collection_name", "clientChatDocsResponse.scope"),
-        "clientChatDocsResponse.scope.default_collection_name"
-      ),
-      key_name: asStringOrNull(
-        pick(scopeRecord, "key_name", "clientChatDocsResponse.scope"),
-        "clientChatDocsResponse.scope.key_name"
-      ),
-      daily_limit_per_device:
-        pick(scopeRecord, "daily_limit_per_device", "clientChatDocsResponse.scope") == null
-          ? null
-          : asNumber(
-              pick(scopeRecord, "daily_limit_per_device", "clientChatDocsResponse.scope"),
-              "clientChatDocsResponse.scope.daily_limit_per_device"
-            ),
-      default_prompt_technique: asString(
-        pick(scopeRecord, "default_prompt_technique", "clientChatDocsResponse.scope"),
-        "clientChatDocsResponse.scope.default_prompt_technique"
-      ) as "balanced" | "concise" | "detailed" | "strict_context" | "socratic",
-    },
-    curl_example: asString(
-      pick(record, "curl_example", "clientChatDocsResponse"),
-      "clientChatDocsResponse.curl_example"
-    ),
-    javascript_example: asString(
-      pick(record, "javascript_example", "clientChatDocsResponse"),
-      "clientChatDocsResponse.javascript_example"
-    ),
-    sse_javascript_example: asString(
-      pick(record, "sse_javascript_example", "clientChatDocsResponse"),
-      "clientChatDocsResponse.sse_javascript_example"
-    ),
-    html_widget_template: asString(
-      pick(record, "html_widget_template", "clientChatDocsResponse"),
-      "clientChatDocsResponse.html_widget_template"
-    ),
-  };
-}
-
-function parseClientApiKeyRecord(value: unknown, path: string): ClientApiKeyRecord {
+export function parseUploadJobStartResponse(value: unknown): UploadJobStartResponse {
+  const path = "uploadJobStartResponse";
   const record = asRecord(value, path);
   return {
-    id: asString(pick(record, "id", path), `${path}.id`),
-    name: asString(pick(record, "name", path), `${path}.name`),
-    description: asStringOrNull(pick(record, "description", path), `${path}.description`),
-    key_prefix: asString(pick(record, "key_prefix", path), `${path}.key_prefix`),
-    allow_all_collections: asBoolean(
-      pick(record, "allow_all_collections", path),
-      `${path}.allow_all_collections`
-    ),
-    allowed_collections: asArray(
-      pick(record, "allowed_collections", path),
-      `${path}.allowed_collections`,
-      (item, index) => asString(item, `${path}.allowed_collections[${index}]`)
-    ),
-    default_collection_name: asStringOrNull(
-      pick(record, "default_collection_name", path),
-      `${path}.default_collection_name`
-    ),
-    daily_limit_per_device:
-      pick(record, "daily_limit_per_device", path) == null
-        ? null
-        : asNumber(pick(record, "daily_limit_per_device", path), `${path}.daily_limit_per_device`),
-    default_system_prompt: asStringOrNull(pick(record, "default_system_prompt", path), `${path}.default_system_prompt`),
-    default_user_prompt_template: asStringOrNull(
-      pick(record, "default_user_prompt_template", path),
-      `${path}.default_user_prompt_template`
-    ),
-    default_prompt_technique: asString(
-      pick(record, "default_prompt_technique", path),
-      `${path}.default_prompt_technique`
-    ) as "balanced" | "concise" | "detailed" | "strict_context" | "socratic",
-    is_active: asBoolean(pick(record, "is_active", path), `${path}.is_active`),
-    last_used_at: asStringOrNull(pick(record, "last_used_at", path), `${path}.last_used_at`),
-    created_at: asStringOrNull(pick(record, "created_at", path), `${path}.created_at`),
-    updated_at: asStringOrNull(pick(record, "updated_at", path), `${path}.updated_at`),
+    status: asString(pick(record, "status", path), `${path}.status`) as UploadJobStartResponse["status"],
+    ...parseUploadJobBase(record, path),
   };
 }
 
-export function parseClientApiKeysResponse(value: unknown): ClientApiKeysResponse {
-  const record = asRecord(value, "clientApiKeysResponse");
+export function parseUploadJobStatusResponse(value: unknown): UploadJobStatusResponse {
+  const path = "uploadJobStatusResponse";
+  const record = asRecord(value, path);
   return {
-    status: asString(pick(record, "status", "clientApiKeysResponse"), "clientApiKeysResponse.status") as "success",
-    total: asNumber(pick(record, "total", "clientApiKeysResponse"), "clientApiKeysResponse.total"),
-    keys: asArray(pick(record, "keys", "clientApiKeysResponse"), "clientApiKeysResponse.keys", (item, index) =>
-      parseClientApiKeyRecord(item, `clientApiKeysResponse.keys[${index}]`)
-    ),
+    status: asString(pick(record, "status", path), `${path}.status`) as UploadJobStatusResponse["status"],
+    ...parseUploadJobBase(record, path),
+    result:
+      "result" in record && record.result != null
+        ? parseUploadDocumentsResponse(record.result)
+        : undefined,
+    error:
+      "error" in record
+        ? record.error == null
+          ? null
+          : asString(record.error, `${path}.error`)
+        : undefined,
   };
 }
 
-export function parseClientApiKeyMutationResponse(value: unknown): ClientApiKeyMutationResponse {
-  const record = asRecord(value, "clientApiKeyMutationResponse");
-  const response: ClientApiKeyMutationResponse = {
-    status: asString(
-      pick(record, "status", "clientApiKeyMutationResponse"),
-      "clientApiKeyMutationResponse.status"
-    ) as "success",
-    key: parseClientApiKeyRecord(
-      pick(record, "key", "clientApiKeyMutationResponse"),
-      "clientApiKeyMutationResponse.key"
+export function parseMemorySnapshotResponse(value: unknown): MemorySnapshotResponse {
+  const record = asRecord(value, "memorySnapshotResponse");
+  const workspaceId =
+    "workspace_id" in record ? asStringOrNull(record.workspace_id, "memorySnapshotResponse.workspace_id") : null;
+  const memoryScope =
+    "memory_scope" in record ? asString(record.memory_scope, "memorySnapshotResponse.memory_scope") : "client";
+  const effectiveClientId =
+    "effective_client_id" in record
+      ? asString(record.effective_client_id, "memorySnapshotResponse.effective_client_id")
+      : undefined;
+  return {
+    status: asString(pick(record, "status", "memorySnapshotResponse"), "memorySnapshotResponse.status") as "success",
+    client_id: asString(pick(record, "client_id", "memorySnapshotResponse"), "memorySnapshotResponse.client_id"),
+    workspace_id: workspaceId,
+    memory_scope: memoryScope as "client" | "client_workspace",
+    effective_client_id: effectiveClientId,
+    history_count: asNumber(pick(record, "history_count", "memorySnapshotResponse"), "memorySnapshotResponse.history_count"),
+    ltm_count: asNumber(pick(record, "ltm_count", "memorySnapshotResponse"), "memorySnapshotResponse.ltm_count"),
+    summary: asString(pick(record, "summary", "memorySnapshotResponse"), "memorySnapshotResponse.summary"),
+    slots: asUnknownRecord(pick(record, "slots", "memorySnapshotResponse"), "memorySnapshotResponse.slots"),
+    history: asArray(
+      pick(record, "history", "memorySnapshotResponse"),
+      "memorySnapshotResponse.history",
+      (item, index) => parseMemoryHistoryMessage(item, `memorySnapshotResponse.history[${index}]`)
     ),
+    context_preview: asString(
+      pick(record, "context_preview", "memorySnapshotResponse"),
+      "memorySnapshotResponse.context_preview"
+    ),
+    ltm_items: asArray(
+      pick(record, "ltm_items", "memorySnapshotResponse"),
+      "memorySnapshotResponse.ltm_items",
+      (item, index) => parseMemoryLtmItem(item, `memorySnapshotResponse.ltm_items[${index}]`)
+    ),
+    generated_at: asString(pick(record, "generated_at", "memorySnapshotResponse"), "memorySnapshotResponse.generated_at"),
   };
-  const apiKey = record["api_key"];
-  if (apiKey != null) {
-    response.api_key = asString(apiKey, "clientApiKeyMutationResponse.api_key");
-  }
-  return response;
 }
 
-export function parseClientApiKeyDeleteResponse(value: unknown): ClientApiKeyDeleteResponse {
-  const record = asRecord(value, "clientApiKeyDeleteResponse");
+export function parseMemoryLtmMutationResponse(value: unknown): MemoryLtmMutationResponse {
+  const record = asRecord(value, "memoryLtmMutationResponse");
+  const workspaceId =
+    "workspace_id" in record ? asStringOrNull(record.workspace_id, "memoryLtmMutationResponse.workspace_id") : null;
+  const memoryScope =
+    "memory_scope" in record ? asString(record.memory_scope, "memoryLtmMutationResponse.memory_scope") : "client";
   return {
     status: asString(
-      pick(record, "status", "clientApiKeyDeleteResponse"),
-      "clientApiKeyDeleteResponse.status"
+      pick(record, "status", "memoryLtmMutationResponse"),
+      "memoryLtmMutationResponse.status"
     ) as "success",
-    deleted_id: asString(
-      pick(record, "deleted_id", "clientApiKeyDeleteResponse"),
-      "clientApiKeyDeleteResponse.deleted_id"
+    client_id: asString(
+      pick(record, "client_id", "memoryLtmMutationResponse"),
+      "memoryLtmMutationResponse.client_id"
     ),
+    workspace_id: workspaceId,
+    memory_scope: memoryScope as "client" | "client_workspace",
+    item: parseMemoryLtmItem(
+      pick(record, "item", "memoryLtmMutationResponse"),
+      "memoryLtmMutationResponse.item"
+    ),
+  };
+}
+
+export function parseRetrievalProfileResponse(value: unknown): RetrievalProfileResponse {
+  const record = asRecord(value, "retrievalProfileResponse");
+  const kb = asRecord(
+    pick(record, "knowledge_base", "retrievalProfileResponse"),
+    "retrievalProfileResponse.knowledge_base"
+  );
+  const defaultsRaw =
+    "defaults" in record ? asObjectOrNull(record.defaults, "retrievalProfileResponse.defaults") : null;
+  return {
+    status: asString(pick(record, "status", "retrievalProfileResponse"), "retrievalProfileResponse.status") as "success",
+    knowledge_base: {
+      id: asString(pick(kb, "id", "retrievalProfileResponse.knowledge_base"), "retrievalProfileResponse.knowledge_base.id"),
+      name: asString(
+        pick(kb, "name", "retrievalProfileResponse.knowledge_base"),
+        "retrievalProfileResponse.knowledge_base.name"
+      ),
+    },
+    profile: parseRetrievalProfile(
+      pick(record, "profile", "retrievalProfileResponse"),
+      "retrievalProfileResponse.profile"
+    ),
+    defaults: defaultsRaw
+      ? {
+          chunk_size: asNumber(
+            pick(defaultsRaw, "chunk_size", "retrievalProfileResponse.defaults"),
+            "retrievalProfileResponse.defaults.chunk_size"
+          ),
+          chunk_overlap: asNumber(
+            pick(defaultsRaw, "chunk_overlap", "retrievalProfileResponse.defaults"),
+            "retrievalProfileResponse.defaults.chunk_overlap"
+          ),
+        }
+      : undefined,
+  };
+}
+
+export function parseRagEvalResponse(value: unknown): RagEvalResponse {
+  const record = asRecord(value, "ragEvalResponse");
+  const summary = asRecord(pick(record, "summary", "ragEvalResponse"), "ragEvalResponse.summary");
+  const results = asArray(
+    pick(record, "results", "ragEvalResponse"),
+    "ragEvalResponse.results",
+    (item, index) => {
+      const row = asRecord(item, `ragEvalResponse.results[${index}]`);
+      const grounding = asRecord(
+        pick(row, "grounding", `ragEvalResponse.results[${index}]`),
+        `ragEvalResponse.results[${index}].grounding`
+      );
+      return {
+        index: asNumber(pick(row, "index", `ragEvalResponse.results[${index}]`), `ragEvalResponse.results[${index}].index`),
+        question: asString(
+          pick(row, "question", `ragEvalResponse.results[${index}]`),
+          `ragEvalResponse.results[${index}].question`
+        ),
+        answer: asString(
+          pick(row, "answer", `ragEvalResponse.results[${index}]`),
+          `ragEvalResponse.results[${index}].answer`
+        ),
+        expected_contains: asArray(
+          pick(row, "expected_contains", `ragEvalResponse.results[${index}]`),
+          `ragEvalResponse.results[${index}].expected_contains`,
+          (token, tokenIndex) => asString(token, `ragEvalResponse.results[${index}].expected_contains[${tokenIndex}]`)
+        ),
+        expectation_hit: asBoolean(
+          pick(row, "expectation_hit", `ragEvalResponse.results[${index}]`),
+          `ragEvalResponse.results[${index}].expectation_hit`
+        ),
+        fallback_used: asBoolean(
+          pick(row, "fallback_used", `ragEvalResponse.results[${index}]`),
+          `ragEvalResponse.results[${index}].fallback_used`
+        ),
+        citation_ok: asBoolean(
+          pick(row, "citation_ok", `ragEvalResponse.results[${index}]`),
+          `ragEvalResponse.results[${index}].citation_ok`
+        ),
+        grounding: {
+          reason: asString(pick(grounding, "reason", `ragEvalResponse.results[${index}].grounding`), `ragEvalResponse.results[${index}].grounding.reason`),
+          score: asNumber(pick(grounding, "score", `ragEvalResponse.results[${index}].grounding`), `ragEvalResponse.results[${index}].grounding.score`),
+          margin: asNumber(pick(grounding, "margin", `ragEvalResponse.results[${index}].grounding`), `ragEvalResponse.results[${index}].grounding.margin`),
+          context_chars: asNumber(
+            pick(grounding, "context_chars", `ragEvalResponse.results[${index}].grounding`),
+            `ragEvalResponse.results[${index}].grounding.context_chars`
+          ),
+          threshold: asNumber(
+            pick(grounding, "threshold", `ragEvalResponse.results[${index}].grounding`),
+            `ragEvalResponse.results[${index}].grounding.threshold`
+          ),
+          passed: asBoolean(
+            pick(grounding, "passed", `ragEvalResponse.results[${index}].grounding`),
+            `ragEvalResponse.results[${index}].grounding.passed`
+          ),
+        },
+        latency_ms: asNumber(
+          pick(row, "latency_ms", `ragEvalResponse.results[${index}]`),
+          `ragEvalResponse.results[${index}].latency_ms`
+        ),
+        retrieved_chunks: asArray(
+          pick(row, "retrieved_chunks", `ragEvalResponse.results[${index}]`),
+          `ragEvalResponse.results[${index}].retrieved_chunks`,
+          (chunk, chunkIndex) => {
+            const chunkRow = asRecord(chunk, `ragEvalResponse.results[${index}].retrieved_chunks[${chunkIndex}]`);
+            const rawPage = pick(chunkRow, "page", `ragEvalResponse.results[${index}].retrieved_chunks[${chunkIndex}]`);
+            if (!(typeof rawPage === "string" || typeof rawPage === "number")) {
+              validationError(
+                `ragEvalResponse.results[${index}].retrieved_chunks[${chunkIndex}].page`,
+                "string|number",
+                rawPage
+              );
+            }
+            return {
+              rank: asNumber(
+                pick(chunkRow, "rank", `ragEvalResponse.results[${index}].retrieved_chunks[${chunkIndex}]`),
+                `ragEvalResponse.results[${index}].retrieved_chunks[${chunkIndex}].rank`
+              ),
+              score: asNumber(
+                pick(chunkRow, "score", `ragEvalResponse.results[${index}].retrieved_chunks[${chunkIndex}]`),
+                `ragEvalResponse.results[${index}].retrieved_chunks[${chunkIndex}].score`
+              ),
+              dense_score: asNumber(
+                pick(chunkRow, "dense_score", `ragEvalResponse.results[${index}].retrieved_chunks[${chunkIndex}]`),
+                `ragEvalResponse.results[${index}].retrieved_chunks[${chunkIndex}].dense_score`
+              ),
+              sparse_score: asNumber(
+                pick(chunkRow, "sparse_score", `ragEvalResponse.results[${index}].retrieved_chunks[${chunkIndex}]`),
+                `ragEvalResponse.results[${index}].retrieved_chunks[${chunkIndex}].sparse_score`
+              ),
+              source: asString(
+                pick(chunkRow, "source", `ragEvalResponse.results[${index}].retrieved_chunks[${chunkIndex}]`),
+                `ragEvalResponse.results[${index}].retrieved_chunks[${chunkIndex}].source`
+              ),
+              page: rawPage,
+            };
+          }
+        ),
+      };
+    }
+  );
+
+  return {
+    status: asString(pick(record, "status", "ragEvalResponse"), "ragEvalResponse.status") as "success",
+    collection_name: asString(pick(record, "collection_name", "ragEvalResponse"), "ragEvalResponse.collection_name"),
+    scorecard_id:
+      "scorecard_id" in record
+        ? asString(record.scorecard_id, "ragEvalResponse.scorecard_id")
+        : undefined,
+    summary: {
+      total_cases: asNumber(pick(summary, "total_cases", "ragEvalResponse.summary"), "ragEvalResponse.summary.total_cases"),
+      fallback_rate: asNumber(pick(summary, "fallback_rate", "ragEvalResponse.summary"), "ragEvalResponse.summary.fallback_rate"),
+      citation_ok_rate: asNumber(
+        pick(summary, "citation_ok_rate", "ragEvalResponse.summary"),
+        "ragEvalResponse.summary.citation_ok_rate"
+      ),
+      grounding_pass_rate: asNumber(
+        pick(summary, "grounding_pass_rate", "ragEvalResponse.summary"),
+        "ragEvalResponse.summary.grounding_pass_rate"
+      ),
+      expectation_hit_rate: asNumber(
+        pick(summary, "expectation_hit_rate", "ragEvalResponse.summary"),
+        "ragEvalResponse.summary.expectation_hit_rate"
+      ),
+      avg_latency_ms: asNumber(
+        pick(summary, "avg_latency_ms", "ragEvalResponse.summary"),
+        "ragEvalResponse.summary.avg_latency_ms"
+      ),
+    },
+    results,
+    timestamp: asString(pick(record, "timestamp", "ragEvalResponse"), "ragEvalResponse.timestamp"),
   };
 }
 
@@ -543,6 +790,13 @@ export function parseWorkspacesResponse(value: unknown): WorkspacesResponse {
         id: asString(pick(ws, "id", "workspace"), `workspacesResponse.workspaces[${index}].id`),
         name: asString(pick(ws, "name", "workspace"), `workspacesResponse.workspaces[${index}].name`),
         is_active: asBoolean(pick(ws, "is_active", "workspace"), `workspacesResponse.workspaces[${index}].is_active`),
+        contact_filter_mode:
+          "contact_filter_mode" in ws
+            ? (asString(
+                pick(ws, "contact_filter_mode", "workspace"),
+                `workspacesResponse.workspaces[${index}].contact_filter_mode`
+              ) as "all" | "only" | "except")
+            : "all",
         knowledge_base: (() => {
           const kb = asObjectOrNull(pick(ws, "knowledge_base", "workspace"), `workspacesResponse.workspaces[${index}].knowledge_base`);
           if (!kb) return null;
@@ -554,6 +808,12 @@ export function parseWorkspacesResponse(value: unknown): WorkspacesResponse {
         groups: asArray(pick(ws, "groups", "workspace"), `workspacesResponse.workspaces[${index}].groups`, (groupItem, groupIndex) =>
           parseWorkspaceGroupRef(groupItem, `workspacesResponse.workspaces[${index}].groups[${groupIndex}]`)
         ),
+        contacts:
+          "contacts" in ws
+            ? asArray(pick(ws, "contacts", "workspace"), `workspacesResponse.workspaces[${index}].contacts`, (contactItem, contactIndex) =>
+                parseContact(contactItem, `workspacesResponse.workspaces[${index}].contacts[${contactIndex}]`)
+              )
+            : [],
       };
     }),
   };
@@ -567,6 +827,10 @@ export function parseWorkspaceRecord(value: unknown): WorkspaceRecord {
     knowledge_base_id: asStringOrNull(pick(record, "knowledge_base_id", "workspaceRecord"), "workspaceRecord.knowledge_base_id"),
     system_prompt: asStringOrNull(pick(record, "system_prompt", "workspaceRecord"), "workspaceRecord.system_prompt"),
     user_prompt_template: asStringOrNull(pick(record, "user_prompt_template", "workspaceRecord"), "workspaceRecord.user_prompt_template"),
+    low_quality_clarification_text: asStringOrNull(
+      pick(record, "low_quality_clarification_text", "workspaceRecord"),
+      "workspaceRecord.low_quality_clarification_text"
+    ),
     is_active: asBoolean(pick(record, "is_active", "workspaceRecord"), "workspaceRecord.is_active"),
     created_at: asString(pick(record, "created_at", "workspaceRecord"), "workspaceRecord.created_at"),
     updated_at: asString(pick(record, "updated_at", "workspaceRecord"), "workspaceRecord.updated_at"),
@@ -581,10 +845,27 @@ export function parseWorkspaceDetailResponse(value: unknown): WorkspaceDetailRes
     knowledge_base_id: asStringOrNull(pick(record, "knowledge_base_id", "workspaceDetailResponse"), "workspaceDetailResponse.knowledge_base_id"),
     system_prompt: asStringOrNull(pick(record, "system_prompt", "workspaceDetailResponse"), "workspaceDetailResponse.system_prompt"),
     user_prompt_template: asStringOrNull(pick(record, "user_prompt_template", "workspaceDetailResponse"), "workspaceDetailResponse.user_prompt_template"),
+    low_quality_clarification_text: asStringOrNull(
+      pick(record, "low_quality_clarification_text", "workspaceDetailResponse"),
+      "workspaceDetailResponse.low_quality_clarification_text"
+    ),
+    contact_filter_mode:
+      "contact_filter_mode" in record
+        ? (asString(
+            pick(record, "contact_filter_mode", "workspaceDetailResponse"),
+            "workspaceDetailResponse.contact_filter_mode"
+          ) as "all" | "only" | "except")
+        : "all",
     is_active: asBoolean(pick(record, "is_active", "workspaceDetailResponse"), "workspaceDetailResponse.is_active"),
     groups: asArray(pick(record, "groups", "workspaceDetailResponse"), "workspaceDetailResponse.groups", (item, index) =>
       parseWorkspaceGroupRef(item, `workspaceDetailResponse.groups[${index}]`)
     ),
+    contacts:
+      "contacts" in record
+        ? asArray(pick(record, "contacts", "workspaceDetailResponse"), "workspaceDetailResponse.contacts", (item, index) =>
+            parseContact(item, `workspaceDetailResponse.contacts[${index}]`)
+          )
+        : [],
   };
 }
 
@@ -650,6 +931,44 @@ export function parseExecutionsResponse(value: unknown): ExecutionsResponse {
     total: asNumber(pick(record, "total", "executionsResponse"), "executionsResponse.total"),
     limit: asNumber(pick(record, "limit", "executionsResponse"), "executionsResponse.limit"),
     offset: asNumber(pick(record, "offset", "executionsResponse"), "executionsResponse.offset"),
+  };
+}
+
+export function parseExecutionDeleteResponse(value: unknown): ExecutionDeleteResponse {
+  const record = asRecord(value, "executionDeleteResponse");
+  return {
+    status: asString(pick(record, "status", "executionDeleteResponse"), "executionDeleteResponse.status") as "success",
+    deleted_id: asString(pick(record, "deleted_id", "executionDeleteResponse"), "executionDeleteResponse.deleted_id"),
+  };
+}
+
+export function parseExecutionBulkDeleteResponse(value: unknown): ExecutionBulkDeleteResponse {
+  const record = asRecord(value, "executionBulkDeleteResponse");
+  return {
+    status: asString(
+      pick(record, "status", "executionBulkDeleteResponse"),
+      "executionBulkDeleteResponse.status"
+    ) as "success",
+    requested_count: asNumber(
+      pick(record, "requested_count", "executionBulkDeleteResponse"),
+      "executionBulkDeleteResponse.requested_count"
+    ),
+    deleted_count: asNumber(
+      pick(record, "deleted_count", "executionBulkDeleteResponse"),
+      "executionBulkDeleteResponse.deleted_count"
+    ),
+  };
+}
+
+export function parseExecutionClearResponse(value: unknown): ExecutionClearResponse {
+  const record = asRecord(value, "executionClearResponse");
+  return {
+    status: asString(pick(record, "status", "executionClearResponse"), "executionClearResponse.status") as "success",
+    scope: asString(pick(record, "scope", "executionClearResponse"), "executionClearResponse.scope"),
+    deleted_count: asNumber(
+      pick(record, "deleted_count", "executionClearResponse"),
+      "executionClearResponse.deleted_count"
+    ),
   };
 }
 

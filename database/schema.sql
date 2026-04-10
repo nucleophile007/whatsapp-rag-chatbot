@@ -30,31 +30,27 @@ CREATE TABLE whatsapp_groups (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Individual contacts discovered via webhook/manual entry
+CREATE TABLE whatsapp_contacts (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    chat_id VARCHAR(255) UNIQUE NOT NULL,  -- e.g., "918102976232@s.whatsapp.net" or "238602730639571@lid"
+    display_name VARCHAR(255),
+    phone_number VARCHAR(32),
+    waha_contact_id VARCHAR(255),  -- WAHA "id", e.g. "919928090748@c.us"
+    lid VARCHAR(255),              -- WAHA "lid", e.g. "5282826608718@lid"
+    phone_jid VARCHAR(255),        -- WAHA "phoneNumber", e.g. "919928090748@s.whatsapp.net"
+    source VARCHAR(30) NOT NULL DEFAULT 'webhook',  -- webhook | manual | conversation
+    is_active BOOLEAN NOT NULL DEFAULT true,
+    last_seen_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 -- Knowledge Bases (Qdrant collections)
 CREATE TABLE knowledge_bases (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     name VARCHAR(255) UNIQUE NOT NULL,
     description TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- Client API keys for public chat endpoint
-CREATE TABLE client_api_keys (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    name VARCHAR(120) UNIQUE NOT NULL,
-    description TEXT,
-    key_hash VARCHAR(128) UNIQUE NOT NULL,
-    key_prefix VARCHAR(24) NOT NULL,
-    allow_all_collections BOOLEAN DEFAULT false,
-    allowed_collections JSONB DEFAULT '[]'::jsonb NOT NULL,
-    default_collection_name VARCHAR(255),
-    daily_limit_per_device INTEGER,
-    default_system_prompt TEXT,
-    default_user_prompt_template TEXT,
-    default_prompt_technique VARCHAR(40) DEFAULT 'balanced',
-    is_active BOOLEAN DEFAULT true,
-    last_used_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -66,6 +62,8 @@ CREATE TABLE workspaces (
     knowledge_base_id UUID REFERENCES knowledge_bases(id) ON DELETE SET NULL,
     system_prompt TEXT,
     user_prompt_template TEXT,
+    low_quality_clarification_text TEXT,
+    contact_filter_mode VARCHAR(20) NOT NULL DEFAULT 'all', -- all | only | except
     is_active BOOLEAN DEFAULT true,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -81,10 +79,21 @@ CREATE TABLE workspace_groups (
     UNIQUE(workspace_id, group_id)
 );
 
+-- Workspace-Contact associations for sender-level filtering
+CREATE TABLE workspace_contacts (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    workspace_id UUID REFERENCES workspaces(id) ON DELETE CASCADE,
+    contact_id UUID REFERENCES whatsapp_contacts(id) ON DELETE CASCADE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(workspace_id, contact_id)
+);
+
 CREATE INDEX idx_workspace_groups_workspace_id ON workspace_groups(workspace_id);
 CREATE INDEX idx_workspace_groups_group_id ON workspace_groups(group_id);
-CREATE INDEX idx_client_api_keys_active ON client_api_keys(is_active);
-CREATE INDEX idx_client_api_keys_name ON client_api_keys(name);
+CREATE INDEX idx_workspace_contacts_workspace_id ON workspace_contacts(workspace_id);
+CREATE INDEX idx_workspace_contacts_contact_id ON workspace_contacts(contact_id);
+CREATE INDEX idx_whatsapp_contacts_chat_id ON whatsapp_contacts(chat_id);
+CREATE INDEX idx_whatsapp_contacts_last_seen ON whatsapp_contacts(last_seen_at DESC);
 
 -- Add update trigger for new tables
 CREATE TRIGGER update_knowledge_bases_updated_at BEFORE UPDATE ON knowledge_bases
@@ -223,7 +232,7 @@ CREATE TRIGGER update_flows_updated_at BEFORE UPDATE ON flows
 CREATE TRIGGER update_whatsapp_groups_updated_at BEFORE UPDATE ON whatsapp_groups
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-CREATE TRIGGER update_client_api_keys_updated_at BEFORE UPDATE ON client_api_keys
+CREATE TRIGGER update_whatsapp_contacts_updated_at BEFORE UPDATE ON whatsapp_contacts
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 -- Insert default node types
@@ -373,3 +382,90 @@ INSERT INTO flow_groups (flow_id, group_id)
 SELECT f.id, g.id
 FROM flows f, whatsapp_groups g
 WHERE f.name = 'PDF Q&A Bot' AND g.chat_id = '120363402503743273@g.us';
+
+-- ============================================================================
+-- Retrieval Profiles + RAG Scorecards
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS knowledge_base_retrieval_profiles (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    knowledge_base_id UUID UNIQUE REFERENCES knowledge_bases(id) ON DELETE CASCADE,
+    final_context_k INTEGER,
+    retrieval_candidates INTEGER,
+    grounding_threshold DOUBLE PRECISION,
+    require_citations BOOLEAN,
+    min_context_chars INTEGER,
+    query_variants_limit INTEGER,
+    clarification_enabled BOOLEAN DEFAULT TRUE,
+    clarification_threshold DOUBLE PRECISION,
+    chunk_size INTEGER,
+    chunk_overlap INTEGER,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_kb_retrieval_profiles_kb_id
+    ON knowledge_base_retrieval_profiles(knowledge_base_id);
+
+CREATE TABLE IF NOT EXISTS rag_eval_scorecards (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    collection_name VARCHAR(255) NOT NULL,
+    knowledge_base_id UUID REFERENCES knowledge_bases(id) ON DELETE SET NULL,
+    total_cases INTEGER NOT NULL,
+    fallback_rate DOUBLE PRECISION NOT NULL,
+    citation_ok_rate DOUBLE PRECISION NOT NULL,
+    grounding_pass_rate DOUBLE PRECISION NOT NULL,
+    expectation_hit_rate DOUBLE PRECISION NOT NULL,
+    avg_latency_ms DOUBLE PRECISION NOT NULL,
+    rag_options JSONB,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_rag_eval_scorecards_collection
+    ON rag_eval_scorecards(collection_name);
+
+CREATE TABLE IF NOT EXISTS rag_eval_case_results (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    scorecard_id UUID REFERENCES rag_eval_scorecards(id) ON DELETE CASCADE,
+    case_index INTEGER NOT NULL,
+    question TEXT NOT NULL,
+    answer TEXT NOT NULL,
+    expected_contains JSONB,
+    expectation_hit BOOLEAN NOT NULL,
+    fallback_used BOOLEAN NOT NULL,
+    citation_ok BOOLEAN NOT NULL,
+    grounding JSONB,
+    latency_ms DOUBLE PRECISION NOT NULL,
+    retrieved_chunks JSONB,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_rag_eval_case_results_scorecard
+    ON rag_eval_case_results(scorecard_id);
+
+-- ============================================================================
+-- Conversation Memory (STM/LTM)
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS conversation_long_term_memories (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    client_id VARCHAR(255) NOT NULL,
+    memory_key VARCHAR(160) NOT NULL,
+    memory_text TEXT NOT NULL,
+    memory_category VARCHAR(50) NOT NULL DEFAULT 'general',
+    confidence DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    source_message TEXT,
+    metadata JSONB,
+    hit_count INTEGER NOT NULL DEFAULT 1,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    last_seen_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(client_id, memory_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_conversation_ltm_client
+    ON conversation_long_term_memories(client_id);
+
+CREATE INDEX IF NOT EXISTS idx_conversation_ltm_active
+    ON conversation_long_term_memories(client_id, is_active);

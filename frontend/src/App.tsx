@@ -9,7 +9,7 @@ const Workspaces = lazy(() => import("./pages/Workspaces"));
 const WorkspaceDetail = lazy(() => import("./pages/WorkspaceDetail"));
 const LogicLayers = lazy(() => import("./pages/LogicLayers"));
 const FlowBuilder = lazy(() => import("./pages/FlowBuilder"));
-const ClientApi = lazy(() => import("./pages/ClientApi"));
+const MemoryDebug = lazy(() => import("./pages/MemoryDebug"));
 
 function PageLoader() {
   return (
@@ -27,7 +27,7 @@ function App() {
           <Route index element={<Dashboard />} />
           <Route path="executions" element={<ExecutionLogs />} />
           <Route path="knowledge-base" element={<KnowledgeBase />} />
-          <Route path="client-api" element={<ClientApi />} />
+          <Route path="memory" element={<MemoryDebug />} />
           <Route path="workspaces" element={<Workspaces />} />
           <Route path="workspaces/:id" element={<WorkspaceDetail />} />
           <Route path="logic-layers" element={<LogicLayers />} />

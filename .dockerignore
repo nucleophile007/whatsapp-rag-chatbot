@@ -22,4 +22,13 @@ build/
 test_*.html
 test_*.py
 sessions/
+sessions2/
 rag/
+frontend/
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.vscode/
+.idea/

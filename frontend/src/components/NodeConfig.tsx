@@ -52,6 +52,14 @@ const TEXTAREA_KEYS = new Set([
   "mention_specific_jids",
   "mention_text_aliases",
 ]);
+const FIELD_HELP: Record<string, string> = {
+  grounding_threshold: "Higher means stricter grounding gate before model answers (0-1).",
+  final_context_k: "Number of top reranked chunks injected into prompt context.",
+  retrieval_candidates: "Initial dense retrieval candidate count before reranking.",
+  require_citations: "If enabled, answers must include citation tags like [C1].",
+  context_limit: "Conversation turns used for follow-up interpretation.",
+  mention_match_plain_message: "If enabled, this trigger also runs on plain messages without @mention/JID match.",
+};
 
 type PresetDefinition = {
   id: string;
@@ -298,6 +306,7 @@ export default function NodeConfig({ selectedNode, onUpdate, onFieldFocus, width
           Supports template vars like <code>{"{{trigger.body}}"}</code>
         </p>
       )}
+      {FIELD_HELP[key] && <p className="text-xs text-muted-foreground">{FIELD_HELP[key]}</p>}
     </div>
   );
 

@@ -1,6 +1,21 @@
-import { useState, useEffect, useMemo, useCallback, useRef, type MouseEvent as ReactMouseEvent } from "react";
+import {
+  useState,
+  useEffect,
+  useMemo,
+  useCallback,
+  useRef,
+  type MouseEvent as ReactMouseEvent,
+  type SetStateAction,
+} from "react";
 import { useParams, useNavigate } from "react-router-dom";
-import { useNodesState, useEdgesState, type Node } from "reactflow";
+import {
+  useNodesState,
+  useEdgesState,
+  type Edge,
+  type Node,
+  type OnEdgesChange,
+  type OnNodesChange,
+} from "reactflow";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { AxiosError } from "axios";
 import { getFlow, updateFlow, testFlow } from "../lib/api";
@@ -54,9 +69,10 @@ export default function FlowBuilder() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const layoutRef = useRef<HTMLElement | null>(null);
-  const [selectedNode, setSelectedNode] = useState<Node<FlowNodeData> | null>(null);
+  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [activeConfigField, setActiveConfigField] = useState<string | null>(null);
   const [flowName, setFlowName] = useState("");
+  const [isDirty, setIsDirty] = useState(false);
   const [paletteWidth, setPaletteWidth] = useState(() => readPanelWidth("flowbuilder.palette.width", 300));
   const [configWidth, setConfigWidth] = useState(() => readPanelWidth("flowbuilder.config.width", 360));
   const [templateWidth, setTemplateWidth] = useState(() => readPanelWidth("flowbuilder.template.width", 420));
@@ -69,27 +85,20 @@ export default function FlowBuilder() {
 
   const [nodes, setNodes, onNodesChange] = useNodesState<FlowNodeData>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState([]);
+  const selectedNode = useMemo(
+    () => nodes.find((node) => node.id === selectedNodeId) || null,
+    [nodes, selectedNodeId]
+  );
 
   useEffect(() => {
     if (flow) {
       setFlowName(flow.name || "");
       setNodes(flow.definition?.nodes || []);
       setEdges(flow.definition?.edges || []);
+      setSelectedNodeId(null);
+      setIsDirty(false);
     }
   }, [flow, setNodes, setEdges]);
-
-  useEffect(() => {
-    if (!selectedNode) return;
-    const latestNode = nodes.find((node) => node.id === selectedNode.id) || null;
-    if (!latestNode) {
-      setSelectedNode(null);
-      setActiveConfigField(null);
-      return;
-    }
-    if (latestNode !== selectedNode) {
-      setSelectedNode(latestNode);
-    }
-  }, [nodes, selectedNode]);
 
   useEffect(() => {
     setActiveConfigField(null);
@@ -119,22 +128,56 @@ export default function FlowBuilder() {
     }
   }, [templateWidth]);
 
-  const isDirty = useMemo(() => {
-    if (!flow) return false;
-    const current = JSON.stringify({ name: flowName, nodes, edges });
-    const initial = JSON.stringify({
-      name: flow.name || "",
-      nodes: flow.definition?.nodes || [],
-      edges: flow.definition?.edges || [],
-    });
-    return current !== initial;
-  }, [flow, flowName, nodes, edges]);
+  useEffect(() => {
+    if (!flow) return;
+    const initialName = flow.name || "";
+    if (flowName !== initialName) {
+      setIsDirty(true);
+    }
+  }, [flow, flowName]);
+
+  const setNodesWithDirty = useCallback(
+    (updater: SetStateAction<Node<FlowNodeData>[]>) => {
+      setIsDirty(true);
+      setNodes(updater);
+    },
+    [setNodes]
+  );
+
+  const setEdgesWithDirty = useCallback(
+    (updater: SetStateAction<Edge[]>) => {
+      setIsDirty(true);
+      setEdges(updater);
+    },
+    [setEdges]
+  );
+
+  const onNodesChangeWithDirty: OnNodesChange = useCallback(
+    (changes) => {
+      if (changes.some((change) => change.type !== "select")) {
+        setIsDirty(true);
+      }
+      onNodesChange(changes);
+    },
+    [onNodesChange]
+  );
+
+  const onEdgesChangeWithDirty: OnEdgesChange = useCallback(
+    (changes) => {
+      if (changes.some((change) => change.type !== "select")) {
+        setIsDirty(true);
+      }
+      onEdgesChange(changes);
+    },
+    [onEdgesChange]
+  );
 
   const saveMutation = useMutation({
     mutationFn: (config: FlowUpdateInput) => updateFlow({ id: id!, data: config }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["flow", id] });
       queryClient.invalidateQueries({ queryKey: ["flows"] });
+      setIsDirty(false);
     },
   });
 
@@ -176,6 +219,7 @@ export default function FlowBuilder() {
         definition: { nodes, edges },
       },
     });
+    setIsDirty(false);
     testMutation.mutate();
   };
 
@@ -186,7 +230,7 @@ export default function FlowBuilder() {
         return;
       }
 
-      setNodes((currentNodes) =>
+      setNodesWithDirty((currentNodes) =>
         currentNodes.map((node) => {
           if (node.id !== selectedNode.id) return node;
 
@@ -212,7 +256,7 @@ export default function FlowBuilder() {
         })
       );
     },
-    [activeConfigField, selectedNode, setNodes]
+    [activeConfigField, selectedNode, setNodesWithDirty]
   );
 
   const startResize = useCallback(
@@ -344,13 +388,13 @@ export default function FlowBuilder() {
         <NodePalette width={paletteWidth} />
         <ResizeHandle onMouseDown={startResize("palette")} />
         <FlowCanvas
-          onNodeSelect={setSelectedNode}
+          onNodeSelect={(node) => setSelectedNodeId(node?.id || null)}
           nodes={nodes}
           edges={edges}
-          setNodes={setNodes}
-          setEdges={setEdges}
-          onNodesChange={onNodesChange}
-          onEdgesChange={onEdgesChange}
+          setNodes={setNodesWithDirty}
+          setEdges={setEdgesWithDirty}
+          onNodesChange={onNodesChangeWithDirty}
+          onEdgesChange={onEdgesChangeWithDirty}
         />
         {selectedNode && (
           <>
@@ -360,7 +404,9 @@ export default function FlowBuilder() {
               selectedNode={selectedNode}
               onFieldFocus={setActiveConfigField}
               onUpdate={(nodeId, data) => {
-                setNodes((nds) => nds.map((node) => (node.id === nodeId ? { ...node, data: { ...node.data, ...data } } : node)));
+                setNodesWithDirty((nds) =>
+                  nds.map((node) => (node.id === nodeId ? { ...node, data: { ...node.data, ...data } } : node))
+                );
               }}
             />
           </>

@@ -5,11 +5,30 @@ import time
 from typing import Dict, Any, Optional, List, Set
 from redis import Redis
 from sqlalchemy.orm import Session
-from database import Workspace
+from langgraph.graph import StateGraph, START, END
+from pydantic import BaseModel, ConfigDict, Field
+from sqlmodel import select
+from database import FlowSQLModel, WorkspaceFlowSQLModel
+from conversation_manager import conversation_manager
 
 logger = logging.getLogger(__name__)
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+
+
+class WorkspaceGraphStateModel(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    workspace: Any
+    payload: Dict[str, Any]
+    db: Session
+    body: str = ""
+    mentioned_ids: List[Any] = Field(default_factory=list)
+    default_bot_lid: str = ""
+    attempted: int = 0
+    failures: List[Dict[str, str]] = Field(default_factory=list)
+    triggered_flow_name: Optional[str] = None
+    execution_id: Optional[str] = None
 
 class WorkspaceEngine:
     """RAG aur Prompts handle karne wala system"""
@@ -38,7 +57,7 @@ class WorkspaceEngine:
             if expires_at <= now:
                 del self._memory_seen_messages[key]
 
-    def _is_new_message(self, workspace: Workspace, message_id: Optional[str]) -> bool:
+    def _is_new_message(self, workspace: Any, message_id: Optional[str]) -> bool:
         if not message_id or self.dedupe_ttl <= 0:
             return True
         dedupe_key = f"workspace:message:{workspace.id}:{message_id}"
@@ -149,8 +168,9 @@ class WorkspaceEngine:
         match_self_lid = self._as_bool(merged.get("mention_match_self_lid"), True)
         match_specific_jids = self._as_bool(merged.get("mention_match_specific_jids"), False)
         match_text_aliases = self._as_bool(merged.get("mention_match_text_aliases"), True)
+        match_plain_message = self._as_bool(merged.get("mention_match_plain_message"), False)
 
-        if not (match_self_lid or match_specific_jids or match_text_aliases):
+        if not (match_self_lid or match_specific_jids or match_text_aliases or match_plain_message):
             # Safe fallback: keep trigger usable instead of silently disabling all checks.
             match_self_lid = True
             match_text_aliases = True
@@ -159,6 +179,7 @@ class WorkspaceEngine:
             "match_self_lid": match_self_lid,
             "match_specific_jids": match_specific_jids,
             "match_text_aliases": match_text_aliases,
+            "match_plain_message": match_plain_message,
             "configured_bot_lid": configured_bot_lid,
             "specific_jids": specific_jids,
             "text_aliases": text_aliases,
@@ -188,9 +209,112 @@ class WorkspaceEngine:
                 if self._strict_text_mention(body, alias):
                     return True
 
+        if mention_config["match_plain_message"]:
+            return bool(str(body or "").strip())
+
         return False
 
-    async def execute_workspace(self, workspace: Workspace, payload: Dict[str, Any], db: Session):
+    def _coerce_workspace_state(self, state: Any) -> WorkspaceGraphStateModel:
+        if isinstance(state, WorkspaceGraphStateModel):
+            return state
+        if isinstance(state, dict):
+            return WorkspaceGraphStateModel(**state)
+        raise ValueError("Invalid workspace graph state")
+
+    def _state_to_graph_dict(self, state_model: WorkspaceGraphStateModel) -> Dict[str, Any]:
+        """Preserve runtime objects (workspace/session) instead of serializing them to plain dicts."""
+        return {
+            "workspace": state_model.workspace,
+            "payload": state_model.payload,
+            "db": state_model.db,
+            "body": state_model.body,
+            "mentioned_ids": state_model.mentioned_ids,
+            "default_bot_lid": state_model.default_bot_lid,
+            "attempted": state_model.attempted,
+            "failures": state_model.failures,
+            "triggered_flow_name": state_model.triggered_flow_name,
+            "execution_id": state_model.execution_id,
+        }
+
+    def _obj_attr(self, value: Any, key: str, default: Any = None) -> Any:
+        if isinstance(value, dict):
+            return value.get(key, default)
+        return getattr(value, key, default)
+
+    def _route_workspace_step(self, state: Dict[str, Any], next_node_name: Optional[str]) -> str:
+        state_model = self._coerce_workspace_state(state)
+        if state_model.triggered_flow_name:
+            return END
+        return next_node_name or END
+
+    def _build_workspace_orchestration_graph(self, flows: List[Any]):
+        from flow_engine import flow_engine
+
+        builder = StateGraph(dict)
+        node_names: List[str] = []
+
+        for index, flow in enumerate(flows):
+            node_name = f"flow_step_{index}"
+            node_names.append(node_name)
+
+            async def run_flow_step(state: Dict[str, Any], current_flow=flow) -> Dict[str, Any]:
+                state_model = self._coerce_workspace_state(state)
+                current_flow_name = str(self._obj_attr(current_flow, "name", "Unknown"))
+                trigger_type = str(self._obj_attr(current_flow, "trigger_type", "") or "").strip()
+                should_run = False
+
+                if trigger_type == "whatsapp_mention":
+                    mention_config = self._resolve_mention_match_config(current_flow, state_model.default_bot_lid)
+                    should_run = self._message_matches_mention_config(
+                        payload=state_model.payload,
+                        body=state_model.body,
+                        mentioned_ids=state_model.mentioned_ids,
+                        mention_config=mention_config,
+                    )
+                elif trigger_type == "whatsapp_message":
+                    should_run = True
+
+                if not should_run:
+                    return self._state_to_graph_dict(state_model)
+
+                state_model.attempted += 1
+                logger.info(f"⚡ Flow trigger ho raha hai: {current_flow_name} ({trigger_type})")
+
+                try:
+                    execution = await flow_engine.execute_flow(
+                        current_flow,
+                        state_model.payload,
+                        state_model.db,
+                        workspace=state_model.workspace,
+                    )
+                    execution_id = self._obj_attr(execution, "id") or self._obj_attr(execution, "execution_id")
+                    if not execution_id:
+                        raise ValueError("Flow execution returned without execution id")
+                    state_model.triggered_flow_name = current_flow_name
+                    state_model.execution_id = str(execution_id)
+                except Exception as e:
+                    logger.error(f"Flow execution fail ho gaya ({current_flow_name}): {e}")
+                    state_model.failures.append({"flow": current_flow_name, "error": str(e)})
+
+                return self._state_to_graph_dict(state_model)
+
+            builder.add_node(node_name, run_flow_step)
+
+        if not node_names:
+            raise ValueError("No flows found for workspace orchestration graph")
+
+        builder.add_edge(START, node_names[0])
+
+        for index, node_name in enumerate(node_names):
+            next_node_name = node_names[index + 1] if index + 1 < len(node_names) else None
+            builder.add_conditional_edges(
+                node_name,
+                lambda state, nxt=next_node_name: self._route_workspace_step(state, nxt),
+            )
+
+        return builder.compile()
+
+    async def execute_workspace(self, workspace: Any, payload: Dict[str, Any], db: Session):
         """
         Workspace execution ab strictly logic layers (flows) par dependent hai.
         Agar workspace mein enabled flow nahi hai, to kuch execute nahi hota.
@@ -204,68 +328,86 @@ class WorkspaceEngine:
             logger.info(f"⏭️ Duplicate message skipped: workspace={workspace.name}, message_id={message_id}")
             return {"status": "skipped", "reason": "duplicate_message"}
 
+        # When memory scope is client+workspace, ingest user message in workspace-specific key
+        # so follow-up context remains isolated per workspace.
+        if (
+            conversation_manager.get_default_memory_scope() == "client_workspace"
+            and not bool(payload.get("fromMe"))
+            and str(body or "").strip()
+        ):
+            history_client_id = (
+                str(payload.get("_memory_client_id") or "").strip()
+                or str(payload.get("participant") or "").strip()
+                or str(payload.get("author") or "").strip()
+                or str(payload.get("_data", {}).get("key", {}).get("participant") or "").strip()
+                or str(payload.get("_data", {}).get("key", {}).get("participantAlt") or "").strip()
+                or str(payload.get("from") or "").strip()
+                or str(payload.get("chatId") or "").strip()
+            )
+            if history_client_id:
+                conversation_manager.add_message(
+                    history_client_id,
+                    "user",
+                    str(body).strip(),
+                    workspace_id=str(workspace.id),
+                    memory_scope="client_workspace",
+                )
+
         # Check karte hain koi customized flows toh nahi hain is workspace ke liye.
-        from flow_engine import flow_engine
-        from database import Flow, WorkspaceFlow
-        
+
         try:
-            flows = db.query(Flow).join(
-                WorkspaceFlow, WorkspaceFlow.flow_id == Flow.id
-            ).filter(
-                WorkspaceFlow.workspace_id == workspace.id,
-                Flow.is_enabled == True
-            ).order_by(WorkspaceFlow.created_at.asc(), Flow.created_at.asc()).all()
+            flows = db.execute(
+                select(FlowSQLModel)
+                .join(WorkspaceFlowSQLModel, WorkspaceFlowSQLModel.flow_id == FlowSQLModel.id)
+                .where(
+                    WorkspaceFlowSQLModel.workspace_id == workspace.id,
+                    FlowSQLModel.is_enabled == True,
+                )
+                .order_by(WorkspaceFlowSQLModel.created_at.asc(), FlowSQLModel.created_at.asc())
+            ).scalars().all()
         except Exception as mapping_error:
             logger.warning(f"workspace_flows lookup unavailable, fallback legacy mapping: {mapping_error}")
-            flows = db.query(Flow).filter(
-                Flow.workspace_id == workspace.id,
-                Flow.is_enabled == True
-            ).order_by(Flow.created_at.asc()).all()
+            flows = db.execute(
+                select(FlowSQLModel)
+                .where(
+                    FlowSQLModel.workspace_id == workspace.id,
+                    FlowSQLModel.is_enabled == True,
+                )
+                .order_by(FlowSQLModel.created_at.asc())
+            ).scalars().all()
 
         if not flows:
             logger.info(f"⏭️ Workspace {workspace.name} skip kiya: koi enabled logic layer attached nahi hai.")
             return {"status": "skipped", "reason": "no_logic_layers_attached"}
 
-        attempted = 0
-        failures = []
-        for flow in flows:
-            trigger_type = (flow.trigger_type or "").strip()
-            should_run = False
-            if trigger_type == "whatsapp_mention":
-                mention_config = self._resolve_mention_match_config(flow, default_bot_lid)
-                should_run = self._message_matches_mention_config(
-                    payload=payload,
-                    body=body,
-                    mentioned_ids=mentioned_ids,
-                    mention_config=mention_config,
-                )
-            elif trigger_type == "whatsapp_message":
-                should_run = True
+        orchestration_graph = self._build_workspace_orchestration_graph(flows)
+        initial_state = WorkspaceGraphStateModel(
+            workspace=workspace,
+            payload=payload,
+            db=db,
+            body=body,
+            mentioned_ids=mentioned_ids,
+            default_bot_lid=default_bot_lid,
+        )
+        initial_state_dict = self._state_to_graph_dict(initial_state)
+        final_state = await orchestration_graph.ainvoke(initial_state_dict)
+        final_state_model = self._coerce_workspace_state(final_state)
 
-            if not should_run:
-                continue
+        if final_state_model.triggered_flow_name and final_state_model.execution_id:
+            return {
+                "status": "success",
+                "triggered_flow": final_state_model.triggered_flow_name,
+                "execution_id": final_state_model.execution_id,
+            }
 
-            attempted += 1
-            logger.info(f"⚡ Flow trigger ho raha hai: {flow.name} ({trigger_type})")
-            try:
-                execution = await flow_engine.execute_flow(flow, payload, db, workspace=workspace)
-                return {
-                    "status": "success",
-                    "triggered_flow": flow.name,
-                    "execution_id": execution.id
-                }
-            except Exception as e:
-                logger.error(f"Flow execution fail ho gaya ({flow.name}): {e}")
-                failures.append({"flow": flow.name, "error": str(e)})
-
-        if attempted == 0:
+        if final_state_model.attempted == 0:
             logger.info(f"⏭️ Workspace {workspace.name} skip kiya: incoming message ke liye matching logic trigger nahi mila.")
             return {"status": "skipped", "reason": "no_matching_logic_trigger"}
 
         return {
             "status": "failed",
             "reason": "all_logic_layers_failed",
-            "failures": failures
+            "failures": final_state_model.failures
         }
 
 workspace_engine = WorkspaceEngine()

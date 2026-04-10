@@ -5,6 +5,7 @@ import signal
 import socket
 import subprocess
 import time
+import uuid
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -29,7 +30,11 @@ DESIRED_KEY = os.getenv("RQ_WORKER_DESIRED_KEY", "rq:workers:desired_count")
 MANAGER_HEARTBEAT_KEY = os.getenv("RQ_WORKER_MANAGER_HEARTBEAT_KEY", "rq:workers:manager:heartbeat")
 MANAGER_HEARTBEAT_TTL = int(os.getenv("RQ_WORKER_MANAGER_HEARTBEAT_TTL_SECONDS", "15"))
 QUEUE_NAMES = [item.strip() for item in os.getenv("RQ_QUEUE_NAMES", "default").split(",") if item.strip()]
-NAME_PREFIX = os.getenv("RQ_WORKER_NAME_PREFIX", socket.gethostname())
+BASE_NAME_PREFIX = os.getenv("RQ_WORKER_NAME_PREFIX", socket.gethostname())
+# Unique per manager process so stale Redis worker entries from prior runs
+# do not block startup with "There exists an active worker named ... already".
+NAME_SUFFIX = os.getenv("RQ_WORKER_NAME_SUFFIX", uuid.uuid4().hex[:8])
+NAME_PREFIX = f"{BASE_NAME_PREFIX}-{NAME_SUFFIX}"
 
 
 @dataclass
@@ -155,11 +160,12 @@ class WorkerPoolManager:
 
     def run(self) -> None:
         logger.info(
-            "Worker pool manager started (queue=%s, min=%s, max=%s, key=%s)",
+            "Worker pool manager started (queue=%s, min=%s, max=%s, key=%s, name_prefix=%s)",
             ",".join(QUEUE_NAMES),
             MIN_WORKERS,
             MAX_WORKERS,
             DESIRED_KEY,
+            NAME_PREFIX,
         )
         while self._running:
             try:

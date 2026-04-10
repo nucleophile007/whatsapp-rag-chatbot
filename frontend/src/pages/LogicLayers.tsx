@@ -43,7 +43,7 @@ export default function LogicLayers() {
     },
   });
 
-  const flows = data?.flows || [];
+  const flows = useMemo(() => data?.flows ?? [], [data?.flows]);
   const suggestedFlowName = useMemo(() => getNextLogicLayerName(flows), [flows]);
   const deletingFlowId = deleteMutation.variables;
 

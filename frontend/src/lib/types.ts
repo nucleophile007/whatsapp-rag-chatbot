@@ -33,6 +33,30 @@ export interface GroupsResponse {
   total?: number;
 }
 
+export interface Contact {
+  id: string;
+  chat_id: string;
+  display_name: string | null;
+  phone_number: string | null;
+  waha_contact_id?: string | null;
+  lid?: string | null;
+  phone_jid?: string | null;
+  source: string;
+  is_active: boolean;
+  last_seen_at: string | null;
+}
+
+export interface ContactsResponse {
+  contacts: Contact[];
+  total?: number;
+}
+
+export interface SyncContactsResponse {
+  status: "success";
+  synced: number;
+  total: number;
+}
+
 export interface ToggleGroupResponse {
   status: "success";
   group_id: string;
@@ -60,6 +84,7 @@ export interface Collection {
   name: string;
   description: string | null;
   created_at: string;
+  retrieval_profile: RetrievalProfile;
 }
 
 export interface CollectionRecord extends Collection {
@@ -84,134 +109,208 @@ export interface UploadDocumentsResponse {
   chunk_count: number;
   pdf_chunk_count?: number;
   url_chunk_count?: number;
+  chunk_size_used?: number;
+  chunk_overlap_used?: number;
+  ocr_used?: boolean;
   points_count?: number;
 }
 
-export interface ClientChatRequestPayload {
+export interface UploadJobStartResponse {
+  status: "queued" | "running" | "completed" | "failed";
+  job_id: string;
+  kb_name: string;
+  created_at: string;
+  updated_at: string;
+  phase: string;
+  phase_label: string;
   message: string;
-  client_id?: string;
-  collection_name?: string;
-  client_system?: string;
-  device_fingerprint?: string;
-  conversation_limit?: number;
-  clear_history?: boolean;
-  system_prompt?: string;
-  user_prompt_template?: string;
-  prompt_technique?: "balanced" | "concise" | "detailed" | "strict_context" | "socratic";
-  temperature?: number;
-  max_output_tokens?: number;
+  progress_percent: number;
+  file_count: number;
+  url_count: number;
+  chunk_size_used: number;
+  chunk_overlap_used: number;
+  ocr_used: boolean;
 }
 
-export interface RateLimitMeta {
-  enabled: boolean;
-  limit: number;
-  used: number;
-  remaining: number | null;
-  scope: string;
-  reset_at?: string;
+export interface UploadJobStatusResponse {
+  status: "queued" | "running" | "completed" | "failed";
+  job_id: string;
+  kb_name: string;
+  created_at: string;
+  updated_at: string;
+  phase: string;
+  phase_label: string;
+  message: string;
+  progress_percent: number;
+  file_count: number;
+  url_count: number;
+  chunk_size_used: number;
+  chunk_overlap_used: number;
+  ocr_used: boolean;
+  result?: UploadDocumentsResponse;
+  error?: string | null;
 }
 
-export interface ClientChatResponse {
-  status: "success";
-  reply: string;
-  client_id: string;
-  client_id_strategy: string;
-  response_mode: "direct" | "rag";
-  collection_name: string | null;
-  prompt_technique: "balanced" | "concise" | "detailed" | "strict_context" | "socratic";
-  rate_limit: RateLimitMeta;
-  model: string;
-  timestamp: string;
+export interface MemoryHistoryMessage {
+  role: string;
+  content: string;
+  timestamp?: string | null;
 }
 
-export interface ClientChatDocsResponse {
-  status: "success";
-  base_url: string;
-  endpoint: string;
-  stream_endpoint: string;
-  method: string;
-  active_collection_name: string | null;
-  available_collections: string[];
-  supported_prompt_techniques: Array<"balanced" | "concise" | "detailed" | "strict_context" | "socratic">;
-  auth: {
-    header: string;
-    required: boolean;
-    mode: "open" | "global" | "tenant";
-  };
-  scope: {
-    allow_all_collections: boolean;
-    allowed_collections: string[];
-    default_collection_name: string | null;
-    key_name: string | null;
-    daily_limit_per_device: number | null;
-    default_prompt_technique: "balanced" | "concise" | "detailed" | "strict_context" | "socratic";
-  };
-  curl_example: string;
-  javascript_example: string;
-  sse_javascript_example: string;
-  html_widget_template: string;
-}
-
-export interface ClientApiKeyRecord {
-  id: string;
-  name: string;
-  description: string | null;
-  key_prefix: string;
-  allow_all_collections: boolean;
-  allowed_collections: string[];
-  default_collection_name: string | null;
-  daily_limit_per_device: number | null;
-  default_system_prompt: string | null;
-  default_user_prompt_template: string | null;
-  default_prompt_technique: "balanced" | "concise" | "detailed" | "strict_context" | "socratic";
+export interface MemoryLtmItem {
+  memory_key: string;
+  memory_text: string;
+  memory_category: string;
+  confidence: number;
+  hit_count: number;
   is_active: boolean;
-  last_used_at: string | null;
-  created_at: string | null;
+  source_message?: string | null;
+  metadata?: Record<string, unknown>;
+  last_seen_at?: string | null;
+  updated_at?: string | null;
+  created_at?: string | null;
+}
+
+export interface MemorySnapshotResponse {
+  status: "success";
+  client_id: string;
+  workspace_id?: string | null;
+  memory_scope?: "client" | "client_workspace";
+  effective_client_id?: string;
+  history_count: number;
+  ltm_count: number;
+  summary: string;
+  slots: Record<string, unknown>;
+  history: MemoryHistoryMessage[];
+  context_preview: string;
+  ltm_items: MemoryLtmItem[];
+  generated_at: string;
+}
+
+export interface MemoryLtmUpdateInput {
+  memory_key: string;
+  memory_text?: string;
+  memory_category?: string;
+  confidence?: number;
+  is_active?: boolean;
+}
+
+export interface MemoryLtmMutationResponse {
+  status: "success";
+  client_id: string;
+  workspace_id?: string | null;
+  memory_scope?: "client" | "client_workspace";
+  item: MemoryLtmItem;
+}
+
+export interface RetrievalProfile {
+  final_context_k: number | null;
+  retrieval_candidates: number | null;
+  grounding_threshold: number | null;
+  require_citations: boolean | null;
+  min_context_chars: number | null;
+  query_variants_limit: number | null;
+  clarification_enabled: boolean | null;
+  clarification_threshold: number | null;
+  chunk_size: number | null;
+  chunk_overlap: number | null;
   updated_at: string | null;
 }
 
-export interface ClientApiKeysResponse {
+export interface RetrievalProfileUpdateInput {
+  final_context_k?: number | null;
+  retrieval_candidates?: number | null;
+  grounding_threshold?: number | null;
+  require_citations?: boolean | null;
+  min_context_chars?: number | null;
+  query_variants_limit?: number | null;
+  clarification_enabled?: boolean | null;
+  clarification_threshold?: number | null;
+  chunk_size?: number | null;
+  chunk_overlap?: number | null;
+}
+
+export interface RetrievalProfileResponse {
   status: "success";
-  total: number;
-  keys: ClientApiKeyRecord[];
+  knowledge_base: {
+    id: string;
+    name: string;
+  };
+  profile: RetrievalProfile;
+  defaults?: {
+    chunk_size: number;
+    chunk_overlap: number;
+  };
 }
 
-export interface ClientApiKeyCreateInput {
-  name: string;
-  description?: string;
-  allow_all_collections?: boolean;
-  allowed_collections?: string[];
-  default_collection_name?: string;
-  daily_limit_per_device?: number;
-  default_system_prompt?: string;
-  default_user_prompt_template?: string;
-  default_prompt_technique?: "balanced" | "concise" | "detailed" | "strict_context" | "socratic";
-  is_active?: boolean;
+export interface RagEvalCaseInput {
+  question: string;
+  expected_contains?: string[];
 }
 
-export interface ClientApiKeyUpdateInput {
-  name?: string;
-  description?: string | null;
-  allow_all_collections?: boolean;
-  allowed_collections?: string[];
-  default_collection_name?: string | null;
-  daily_limit_per_device?: number;
-  default_system_prompt?: string | null;
-  default_user_prompt_template?: string | null;
-  default_prompt_technique?: "balanced" | "concise" | "detailed" | "strict_context" | "socratic";
-  is_active?: boolean;
-  rotate_key?: boolean;
+export interface RagTuningOptions {
+  grounding_threshold?: number;
+  final_context_k?: number;
+  retrieval_candidates?: number;
+  require_citations?: boolean;
+  min_context_chars?: number;
+  query_variants_limit?: number;
+  clarification_enabled?: boolean;
+  clarification_threshold?: number;
 }
 
-export interface ClientApiKeyMutationResponse {
+export interface RagEvalRequestPayload {
+  collection_name: string;
+  cases: RagEvalCaseInput[];
+  conversation_history?: string;
+  system_prompt?: string;
+  user_prompt_template?: string;
+  rag_options?: RagTuningOptions;
+}
+
+export interface RagEvalRetrievedChunk {
+  rank: number;
+  score: number;
+  dense_score: number;
+  sparse_score: number;
+  source: string;
+  page: string | number;
+}
+
+export interface RagEvalCaseResult {
+  index: number;
+  question: string;
+  answer: string;
+  expected_contains: string[];
+  expectation_hit: boolean;
+  fallback_used: boolean;
+  citation_ok: boolean;
+  grounding: {
+    reason: string;
+    score: number;
+    margin: number;
+    context_chars: number;
+    threshold: number;
+    passed: boolean;
+  };
+  latency_ms: number;
+  retrieved_chunks: RagEvalRetrievedChunk[];
+}
+
+export interface RagEvalResponse {
   status: "success";
-  key: ClientApiKeyRecord;
-  api_key?: string;
-}
-
-export interface ClientApiKeyDeleteResponse {
-  status: "success";
-  deleted_id: string;
+  collection_name: string;
+  scorecard_id?: string;
+  summary: {
+    total_cases: number;
+    fallback_rate: number;
+    citation_ok_rate: number;
+    grounding_pass_rate: number;
+    expectation_hit_rate: number;
+    avg_latency_ms: number;
+  };
+  results: RagEvalCaseResult[];
+  timestamp: string;
 }
 
 export interface WorkspaceGroupRef {
@@ -224,8 +323,10 @@ export interface WorkspaceSummary {
   id: string;
   name: string;
   is_active: boolean;
+  contact_filter_mode: "all" | "only" | "except";
   knowledge_base: { id: string; name: string } | null;
   groups: WorkspaceGroupRef[];
+  contacts: Contact[];
 }
 
 export interface WorkspacesResponse {
@@ -238,8 +339,11 @@ export interface WorkspaceDetailResponse {
   knowledge_base_id: string | null;
   system_prompt: string | null;
   user_prompt_template: string | null;
+  low_quality_clarification_text: string | null;
+  contact_filter_mode: "all" | "only" | "except";
   is_active: boolean;
   groups: WorkspaceGroupRef[];
+  contacts: Contact[];
 }
 
 export interface WorkspaceRecord {
@@ -248,6 +352,7 @@ export interface WorkspaceRecord {
   knowledge_base_id: string | null;
   system_prompt: string | null;
   user_prompt_template: string | null;
+  low_quality_clarification_text: string | null;
   is_active: boolean;
   created_at: string;
   updated_at: string;
@@ -258,6 +363,9 @@ export interface WorkspaceFormInput {
   knowledge_base_id: string;
   system_prompt?: string | null;
   user_prompt_template?: string | null;
+  low_quality_clarification_text?: string | null;
+  contact_filter_mode?: "all" | "only" | "except";
+  contact_chat_ids?: string[];
   group_ids: string[];
 }
 
@@ -356,6 +464,23 @@ export interface ExecutionsResponse {
   total: number;
   limit: number;
   offset: number;
+}
+
+export interface ExecutionDeleteResponse {
+  status: "success";
+  deleted_id: string;
+}
+
+export interface ExecutionBulkDeleteResponse {
+  status: "success";
+  requested_count: number;
+  deleted_count: number;
+}
+
+export interface ExecutionClearResponse {
+  status: "success";
+  scope: string;
+  deleted_count: number;
 }
 
 export interface TestFlowResponse {

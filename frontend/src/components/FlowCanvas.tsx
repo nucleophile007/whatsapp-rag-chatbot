@@ -123,7 +123,7 @@ export default function FlowCanvas({
         defaultViewport={{ x: 0, y: 0, zoom: 0.9 }}
       >
         <Controls className="!border !border-border !bg-white !shadow-sm" />
-        <Background variant={BackgroundVariant.Dots} gap={18} size={1.2} color="#d4dce0" />
+        <Background variant={BackgroundVariant.Lines} gap={36} size={0.5} color="#e4eaee" />
       </ReactFlow>
     </div>
   );

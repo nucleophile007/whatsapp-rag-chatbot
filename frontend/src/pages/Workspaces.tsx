@@ -29,6 +29,9 @@ const defaultForm: WorkspaceFormInput = {
   knowledge_base_id: "",
   system_prompt: "You are a helpful assistant. Use the following context to answer questions.",
   user_prompt_template: "Question: {{body}}\n\nContext: {{rag_result}}",
+  low_quality_clarification_text: "",
+  contact_filter_mode: "all",
+  contact_chat_ids: [],
   group_ids: [],
 };
 

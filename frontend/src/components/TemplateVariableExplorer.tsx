@@ -16,6 +16,8 @@ type FlatEntry = {
   type: string;
 };
 
+const MAX_FLAT_ROWS = 320;
+
 const FALLBACK_TRIGGER = {
   id: "demo_message_id",
   body: "Hello bot, share policy details",
@@ -33,8 +35,14 @@ const FALLBACK_TRIGGER = {
 const isObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
-const flattenValue = (value: unknown, prefix = "", depth = 0, out: FlatEntry[] = []): FlatEntry[] => {
-  if (depth > 7) {
+const flattenValue = (
+  value: unknown,
+  prefix = "",
+  depth = 0,
+  out: FlatEntry[] = [],
+  maxRows = MAX_FLAT_ROWS
+): FlatEntry[] => {
+  if (depth > 7 || out.length >= maxRows) {
     return out;
   }
 
@@ -45,20 +53,20 @@ const flattenValue = (value: unknown, prefix = "", depth = 0, out: FlatEntry[] =
     }
     value.forEach((item, index) => {
       const childPath = prefix ? `${prefix}.${index}` : String(index);
-      flattenValue(item, childPath, depth + 1, out);
+      flattenValue(item, childPath, depth + 1, out, maxRows);
     });
     return out;
   }
 
   if (isObject(value)) {
-    const entries = Object.entries(value).sort(([a], [b]) => a.localeCompare(b));
+    const entries = Object.entries(value);
     if (entries.length === 0) {
       out.push({ path: prefix, value: "{}", type: "object" });
       return out;
     }
     entries.forEach(([key, child]) => {
       const childPath = prefix ? `${prefix}.${key}` : key;
-      flattenValue(child, childPath, depth + 1, out);
+      flattenValue(child, childPath, depth + 1, out, maxRows);
     });
     return out;
   }
@@ -79,9 +87,10 @@ export default function TemplateVariableExplorer({ flowId, targetField, onInsert
 
   const { data, isLoading, isFetching } = useQuery({
     queryKey: ["executions", "flow-template-vars", flowId],
-    queryFn: () => getExecutions({ flow_id: flowId, limit: 25 }),
+    queryFn: () => getExecutions({ flow_id: flowId, limit: 5 }),
     enabled: Boolean(flowId),
-    refetchInterval: 7000,
+    refetchInterval: 15000,
+    refetchOnWindowFocus: false,
   });
 
   const latestTriggerData = useMemo(() => {
@@ -150,6 +159,11 @@ export default function TemplateVariableExplorer({ flowId, targetField, onInsert
       </div>
 
       <div className="space-y-2">
+        {rows.length >= MAX_FLAT_ROWS && (
+          <p className="rounded-lg border border-amber-200 bg-amber-50 p-2 text-xs text-amber-700">
+            Showing first {MAX_FLAT_ROWS} variables for performance.
+          </p>
+        )}
         {filteredRows.map((row) => (
           <div
             key={row.path}

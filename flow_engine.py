@@ -13,12 +13,32 @@ from typing import Dict, Any, Optional, List
 from datetime import datetime
 from sqlalchemy.orm import Session
 import asyncio
+from langgraph.graph import StateGraph, START, END
+from pydantic import BaseModel, ConfigDict, Field
+from sqlmodel import select
 
-from database import Flow, FlowExecution, FlowGroup, WhatsAppGroup, Workspace, NodeType, get_db
+from database import (
+    FlowExecutionSQLModel,
+    KnowledgeBaseSQLModel,
+    WhatsAppGroupSQLModel,
+    WorkspaceSQLModel,
+)
 from waha_client import waha_client
 from conversation_manager import conversation_manager
 
 logger = logging.getLogger(__name__)
+
+
+class FlowGraphStateModel(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    context: "FlowContext"
+    flow_definition: Dict[str, Any]
+    node_lookup: Dict[str, Dict[str, Any]]
+    current_node_id: Optional[str] = None
+    next_node_id: Optional[str] = None
+    last_result: Any = None
+    nodes_executed_log: List[Dict[str, Any]] = Field(default_factory=list)
 
 class FlowContext:
     """Flow chalte waqt variables aur data yahan save rehta hai"""
@@ -35,9 +55,6 @@ class FlowContext:
         """Node ka result store karte hain"""
         self.data["nodes"][node_id] = output
         self.data[node_id] = output
-    
-    def get_node_output(self, node_id: str) -> Any:
-        return self.data["nodes"].get(node_id)
     
     def resolve_template(self, template: str) -> str:
         """
@@ -104,11 +121,11 @@ class FlowEngine:
     
     async def execute_flow(
         self,
-        flow: Flow,
+        flow: Any,
         trigger_data: Dict[str, Any],
         db: Session,
-        workspace: Optional[Workspace] = None,
-    ) -> FlowExecution:
+        workspace: Optional[Any] = None,
+    ) -> Any:
         """
         Flow execute karne ki bheed-bharakka yahan hoti hai.
         """
@@ -137,7 +154,7 @@ class FlowEngine:
         flow_definition = flow.definition
         
         # Execution log shuru karte hain
-        execution = FlowExecution(
+        execution = FlowExecutionSQLModel(
             flow_id=flow.id,
             trigger_data=normalized_trigger,
             status="running",
@@ -149,7 +166,9 @@ class FlowEngine:
         try:
              chat_id = trigger_data.get("chat_id") or trigger_data.get("message", {}).get("chatId")
              if chat_id:
-                 group = db.query(WhatsAppGroup).filter(WhatsAppGroup.chat_id == chat_id).first()
+                 group = db.execute(
+                     select(WhatsAppGroupSQLModel).where(WhatsAppGroupSQLModel.chat_id == chat_id)
+                 ).scalars().first()
                  if group:
                      execution.group_id = group.id
         except Exception:
@@ -159,6 +178,8 @@ class FlowEngine:
         db.commit()
         db.refresh(execution)
         
+        nodes_executed_log: List[Dict[str, Any]] = []
+
         try:
             if not flow_definition.get("nodes"):
                 execution.status = "completed"
@@ -166,38 +187,16 @@ class FlowEngine:
                 db.commit()
                 return execution
 
-            current_node_id = flow_definition["nodes"][0]["id"]
-            
-            nodes_executed_log = []
+            flow_graph = self._build_langgraph(flow_definition)
+            initial_state = FlowGraphStateModel(
+                context=context,
+                flow_definition=flow_definition,
+                node_lookup=self._build_node_lookup(flow_definition),
+            ).model_dump(mode="python")
 
-            while current_node_id:
-                node = self._find_node(flow_definition, current_node_id)
-                
-                if not node:
-                    break
-                
-                logger.info(f"Node chal raha hai: {node.get('name', 'Unknown')}")
-                
-                handler = self.node_handlers.get(node.get("type"))
-                if not handler:
-                    raise ValueError(f"Bhai ye kaunsa node type hai: {node.get('type')}")
-                
-                result = await handler(node, context)
-                context.set_node_output(node["id"], result)
-                
-                # Agla node kaunsa hai?
-                next_node_id = self._get_next_node(node, result, flow_definition)
-                
-                nodes_executed_log.append({
-                    "node_id": node["id"],
-                    "node_name": node.get("name"),
-                    "type": node.get("type"),
-                    "result": str(result)[:500],
-                    "next_node": next_node_id,
-                    "timestamp": datetime.now().isoformat()
-                })
-                
-                current_node_id = next_node_id
+            final_state = await flow_graph.ainvoke(initial_state)
+            final_state_model = self._coerce_state(final_state)
+            nodes_executed_log = final_state_model.nodes_executed_log
             
             execution.status = "completed"
             execution.completed_at = datetime.now()
@@ -213,14 +212,99 @@ class FlowEngine:
             execution.nodes_executed = nodes_executed_log if 'nodes_executed_log' in locals() else []
             db.commit()
             raise
+        finally:
+            try:
+                self._stop_typing_indicator(context, reason="flow_finalize")
+            except Exception as typing_error:
+                logger.warning("Typing cleanup failed at flow finalize: %s", typing_error)
         
         return execution
-    
-    def _find_node(self, flow: Dict[str, Any], node_id: str) -> Optional[Dict[str, Any]]:
-        for node in flow.get("nodes", []):
-            if node["id"] == node_id:
-                return node
-        return None
+
+    def _build_node_lookup(self, flow: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+        return {
+            str(node.get("id")): node
+            for node in flow.get("nodes", [])
+            if isinstance(node, dict) and node.get("id")
+        }
+
+    def _coerce_state(self, state: Any) -> FlowGraphStateModel:
+        if isinstance(state, FlowGraphStateModel):
+            return state
+        if isinstance(state, dict):
+            return FlowGraphStateModel(**state)
+        raise ValueError("Invalid LangGraph flow state")
+
+    async def _run_graph_node(self, node_id: str, state: Dict[str, Any]) -> Dict[str, Any]:
+        state_model = self._coerce_state(state)
+        node_lookup = state_model.node_lookup or {}
+        flow_definition = state_model.flow_definition or {}
+        context = state_model.context
+
+        node = node_lookup.get(node_id)
+        if not node:
+            raise ValueError(f"Node not found in definition: {node_id}")
+        if context is None:
+            raise ValueError("Flow context missing in graph state")
+
+        logger.info(f"Node chal raha hai: {node.get('name', 'Unknown')}")
+
+        handler = self.node_handlers.get(node.get("type"))
+        if not handler:
+            raise ValueError(f"Bhai ye kaunsa node type hai: {node.get('type')}")
+
+        result = await handler(node, context)
+        context.set_node_output(node_id, result)
+
+        next_node_id = self._get_next_node(node, result, flow_definition)
+        state_model.nodes_executed_log.append(
+            {
+                "node_id": node_id,
+                "node_name": node.get("name"),
+                "type": node.get("type"),
+                "result": str(result)[:500],
+                "next_node": next_node_id,
+                "timestamp": datetime.now().isoformat(),
+            }
+        )
+
+        state_model.current_node_id = node_id
+        state_model.next_node_id = next_node_id
+        state_model.last_result = result
+        return state_model.model_dump(mode="python")
+
+    def _route_from_state(self, state: Dict[str, Any]) -> str:
+        state_model = self._coerce_state(state)
+        next_node_id = state_model.next_node_id
+        return str(next_node_id) if next_node_id else END
+
+    def _build_langgraph(self, flow_definition: Dict[str, Any]):
+        nodes = flow_definition.get("nodes", [])
+        if not nodes:
+            raise ValueError("Flow definition mein nodes missing hain")
+
+        builder = StateGraph(dict)
+        node_ids: List[str] = []
+
+        for node in nodes:
+            node_id = str(node.get("id") or "").strip()
+            if not node_id:
+                continue
+            node_ids.append(node_id)
+            
+            async def run_node(state: Dict[str, Any], nid=node_id) -> Dict[str, Any]:
+                return await self._run_graph_node(nid, state)
+
+            builder.add_node(node_id, run_node)
+
+        if not node_ids:
+            raise ValueError("Flow definition mein valid node ids nahi mile")
+
+        builder.add_edge(START, node_ids[0])
+
+        for node_id in node_ids:
+            builder.add_conditional_edges(node_id, self._route_from_state)
+
+        return builder.compile()
     
     def _get_next_node(self, node: Dict[str, Any], result: Any, flow: Dict[str, Any]) -> Optional[str]:
         """Agla node dhundne ka logic"""
@@ -350,6 +434,132 @@ class FlowEngine:
             if value:
                 return value
         return ""
+
+    def _resolve_trigger_waha_session(self, context: FlowContext) -> str:
+        trigger = context.data.get("trigger", {}) if isinstance(context.data, dict) else {}
+        waha_meta = trigger.get("_waha", {}) if isinstance(trigger.get("_waha"), dict) else {}
+        candidates = [
+            waha_meta.get("instance"),
+            waha_meta.get("session"),
+            trigger.get("session"),
+        ]
+        for candidate in candidates:
+            value = str(candidate or "").strip()
+            if value:
+                return value
+        return ""
+
+    def _resolve_trigger_chat_id(self, context: FlowContext) -> str:
+        trigger = context.data.get("trigger", {}) if isinstance(context.data, dict) else {}
+        candidates = [
+            trigger.get("chatId"),
+            trigger.get("chat_id"),
+            trigger.get("from"),
+            trigger.get("to"),
+        ]
+        for candidate in candidates:
+            value = str(candidate or "").strip()
+            if value:
+                return value
+        return ""
+
+    def _resolve_workspace_id(self, context: FlowContext) -> str:
+        if not isinstance(context.data, dict):
+            return ""
+        candidates = [
+            context.data.get("workspace", {}).get("id"),
+            context.data.get("flow", {}).get("workspace_id"),
+        ]
+        for candidate in candidates:
+            value = str(candidate or "").strip()
+            if value:
+                return value
+        return ""
+
+    def _typing_state(self, context: FlowContext) -> Dict[str, Any]:
+        existing = context.data.get("_typing") if isinstance(context.data, dict) else None
+        if isinstance(existing, dict):
+            return existing
+        state = {"active": False, "chat_id": "", "session": "", "started_at": None}
+        context.data["_typing"] = state
+        return state
+
+    def _start_typing_indicator(self, context: FlowContext, chat_id: str, session_alias: str) -> bool:
+        chat_value = str(chat_id or "").strip()
+        if not chat_value:
+            return False
+        if "@" not in chat_value:
+            return False
+
+        trigger = context.data.get("trigger", {}) if isinstance(context.data, dict) else {}
+        if bool(trigger.get("fromMe")):
+            return False
+
+        state = self._typing_state(context)
+        existing_chat = str(state.get("chat_id") or "").strip()
+        existing_session = str(state.get("session") or "").strip()
+        requested_session = str(session_alias or "").strip()
+        if bool(state.get("active")) and existing_chat == chat_value and existing_session == requested_session:
+            return True
+
+        if bool(state.get("active")) and existing_chat:
+            self._stop_typing_indicator(context, reason="switch_chat")
+
+        success, response = waha_client.start_typing(chat_value, session_alias=requested_session or None)
+        if success:
+            state["active"] = True
+            state["chat_id"] = chat_value
+            state["session"] = requested_session
+            state["started_at"] = datetime.now().isoformat()
+            logger.info("Typing started chat=%s session=%s", chat_value, requested_session or "default")
+            return True
+
+        logger.warning("Typing start failed chat=%s session=%s response=%s", chat_value, requested_session, response)
+        return False
+
+    def _stop_typing_indicator(
+        self,
+        context: FlowContext,
+        chat_id: str = "",
+        session_alias: str = "",
+        reason: str = "completed",
+    ) -> bool:
+        state = self._typing_state(context)
+        active = bool(state.get("active"))
+        if not active:
+            return False
+
+        chat_value = str(chat_id or "").strip() or str(state.get("chat_id") or "").strip()
+        session_value = str(session_alias or "").strip() or str(state.get("session") or "").strip()
+
+        if not chat_value:
+            if active:
+                state["active"] = False
+            return False
+        if "@" not in chat_value:
+            state["active"] = False
+            state["chat_id"] = ""
+            state["session"] = ""
+            state["started_at"] = None
+            return False
+
+        success, response = waha_client.stop_typing(chat_value, session_alias=session_value or None)
+        if success:
+            state["active"] = False
+            state["chat_id"] = ""
+            state["session"] = ""
+            state["started_at"] = None
+            logger.info("Typing stopped chat=%s reason=%s", chat_value, reason)
+            return True
+
+        logger.warning(
+            "Typing stop failed chat=%s session=%s reason=%s response=%s",
+            chat_value,
+            session_value,
+            reason,
+            response,
+        )
+        return False
     
     async def _execute_rag_query(self, config: Dict[str, Any], context: FlowContext) -> Dict[str, Any]:
         """RAG se gyan nikaalte hain"""
@@ -366,19 +576,25 @@ class FlowEngine:
         collection_name = context.resolve_template(config.get("collection_name", "")).strip()
         workspace = None
 
-        workspace_id = (
-            context.data.get("workspace", {}).get("id")
-            or context.data.get("flow", {}).get("workspace_id")
-        )
+        workspace_id = self._resolve_workspace_id(context)
         if workspace_id:
             try:
                 workspace_uuid = uuid.UUID(workspace_id)
-                workspace = context.db.query(Workspace).filter(Workspace.id == workspace_uuid).first()
+                workspace = context.db.execute(
+                    select(WorkspaceSQLModel).where(WorkspaceSQLModel.id == workspace_uuid)
+                ).scalars().first()
             except Exception:
                 workspace = None
 
-        if not collection_name and workspace and workspace.knowledge_base:
-            collection_name = workspace.knowledge_base.name
+        if not collection_name and workspace:
+            if getattr(workspace, "knowledge_base", None):
+                collection_name = str(workspace.knowledge_base.name or "").strip()
+            if not collection_name and getattr(workspace, "knowledge_base_id", None):
+                kb = context.db.execute(
+                    select(KnowledgeBaseSQLModel).where(KnowledgeBaseSQLModel.id == workspace.knowledge_base_id)
+                ).scalars().first()
+                if kb:
+                    collection_name = str(kb.name or "").strip()
 
         if not collection_name:
             collection_name = os.getenv("DEFAULT_QDRANT_COLLECTION", "").strip()
@@ -390,16 +606,47 @@ class FlowEngine:
             )
 
         client_id = self._resolve_trigger_client_id(context)
+        trigger_chat_id = self._resolve_trigger_chat_id(context)
+        trigger_session = self._resolve_trigger_waha_session(context)
+        self._start_typing_indicator(context, trigger_chat_id, trigger_session)
         
         conversation_history = ""
         if config.get("include_conversation_history", True) and client_id:
-             history_limit = int(config.get("context_limit", 5))
-             conversation_history = conversation_manager.get_context_string(client_id, limit=history_limit)
+            history_limit = int(config.get("context_limit", os.getenv("CHAT_CONTEXT_TURN_LIMIT", "24")))
+            context_token_budget = int(config.get("context_token_budget", os.getenv("STM_CONTEXT_TOKEN_BUDGET", "1200")))
+            conversation_history = conversation_manager.get_context_string(
+                client_id,
+                limit=max(2, history_limit),
+                query=query,
+                token_budget=max(250, context_token_budget),
+                workspace_id=workspace_id or None,
+            )
 
         workspace_system_prompt = (workspace.system_prompt or "").strip() if workspace else ""
         workspace_user_prompt_template = (workspace.user_prompt_template or "").strip() if workspace else ""
+        workspace_low_quality_clarification_text = (
+            (workspace.low_quality_clarification_text or "").strip() if workspace else ""
+        )
         action_system_prompt = context.resolve_template(config.get("system_prompt", "")).strip()
         action_user_prompt_template = context.resolve_template(config.get("user_prompt_template", "")).strip()
+        rag_options: Dict[str, Any] = {}
+
+        raw_grounding_threshold = context.resolve_template(config.get("grounding_threshold", ""))
+        if str(raw_grounding_threshold).strip():
+            rag_options["grounding_threshold"] = self._safe_float(raw_grounding_threshold, "grounding_threshold")
+
+        raw_final_context_k = context.resolve_template(config.get("final_context_k", ""))
+        if str(raw_final_context_k).strip():
+            rag_options["final_context_k"] = int(self._safe_float(raw_final_context_k, "final_context_k"))
+
+        raw_retrieval_candidates = context.resolve_template(config.get("retrieval_candidates", ""))
+        if str(raw_retrieval_candidates).strip():
+            rag_options["retrieval_candidates"] = int(
+                self._safe_float(raw_retrieval_candidates, "retrieval_candidates")
+            )
+
+        if "require_citations" in config:
+            rag_options["require_citations"] = self._safe_bool(config.get("require_citations"), default=False)
         
         result = await asyncio.to_thread(
             process_query,
@@ -407,10 +654,13 @@ class FlowEngine:
             client_id=client_id,
             conversation_history=conversation_history,
             whatsapp_message_id=context.data.get("trigger", {}).get("id"),
+            waha_session=trigger_session,
             collection_name=collection_name,
             system_prompt=(action_system_prompt or workspace_system_prompt or None),
             user_prompt_template=(action_user_prompt_template or workspace_user_prompt_template or None),
+            low_quality_clarification_text=(workspace_low_quality_clarification_text or None),
             emit_side_effects=False,
+            rag_options=rag_options,
         )
         
         return {
@@ -488,12 +738,15 @@ class FlowEngine:
         message_type = str(context.resolve_template(str(config.get("message_type", "text")))).strip().lower() or "text"
         chat_id = context.resolve_template(config.get("chat_id", ""))
         reply_to = context.resolve_template(config.get("reply_to", ""))
+        configured_session = context.resolve_template(config.get("session", ""))
 
         payload: Dict[str, Any] = {}
         if chat_id:
             payload["chatId"] = chat_id
         if reply_to:
             payload["reply_to"] = reply_to
+        if configured_session:
+            payload["session"] = configured_session
 
         if message_type == "text":
             resolved_text = context.resolve_template(config.get("text", ""))
@@ -603,6 +856,11 @@ class FlowEngine:
         else:
             raise ValueError("payload_json object hona chahiye")
 
+        if not str(payload.get("session") or "").strip():
+            trigger_session = self._resolve_trigger_waha_session(context)
+            if trigger_session:
+                payload["session"] = trigger_session
+
         if message_type == "text" and "text" in payload:
             payload["text"] = self._normalize_text_payload(payload.get("text"))
 
@@ -610,13 +868,26 @@ class FlowEngine:
             raise ValueError("Bhai, chatId/chat_id toh de do!")
 
         success, response = waha_client.send_dynamic_message(message_type=message_type, payload=payload)
+        if success:
+            self._stop_typing_indicator(
+                context,
+                chat_id=str(payload.get("chatId") or "").strip(),
+                session_alias=str(payload.get("session") or "").strip(),
+                reason="send_success",
+            )
 
         # Persist assistant text in conversation history for follow-up reasoning.
         if success and message_type == "text":
             history_client_id = self._resolve_trigger_client_id(context) or str(payload.get("chatId") or "").strip()
+            workspace_id = self._resolve_workspace_id(context)
             text_value = str(payload.get("text") or "").strip()
             if history_client_id and text_value:
-                conversation_manager.add_message(history_client_id, "assistant", text_value)
+                conversation_manager.add_message(
+                    history_client_id,
+                    "assistant",
+                    text_value,
+                    workspace_id=workspace_id or None,
+                )
 
         return {
             "sent": success,

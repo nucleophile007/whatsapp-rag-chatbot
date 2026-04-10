@@ -33,7 +33,8 @@ export default function Dashboard() {
   const { data: workerStatus, isLoading: workerLoading, isFetching } = useQuery({
     queryKey: ["workers", "status"],
     queryFn: getWorkerStatus,
-    refetchInterval: 5000,
+    refetchInterval: 15000,
+    refetchOnWindowFocus: false,
   });
   const [desiredInput, setDesiredInput] = useState<string>("");
 

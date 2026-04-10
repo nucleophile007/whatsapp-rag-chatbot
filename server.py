@@ -3,11 +3,13 @@ import asyncio
 import logging
 import hashlib
 import json
-import hmac
-import secrets
+import time
+import threading
+import re
+from collections import defaultdict
 from datetime import datetime, timedelta
 import os
-from redis import Redis
+import requests
 from pydantic import BaseModel, Field
 from typing import Dict, List, Any, Optional
 
@@ -16,14 +18,14 @@ load_dotenv()
 
 from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect, Request, Depends, HTTPException, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
 from client.rq_client import queue
 from queues.worker import process_query
 from queues.webhook_jobs import process_whatsapp_payload
 from rq import Worker
 from rq.registry import DeferredJobRegistry, FailedJobRegistry, FinishedJobRegistry, ScheduledJobRegistry, StartedJobRegistry
-from sqlalchemy import or_, text
+from sqlalchemy import or_, text, func, delete
 from sqlalchemy.orm import Session
+from sqlmodel import select
 import shutil
 import tempfile
 import uuid
@@ -32,24 +34,29 @@ import uuid
 from database import (
     get_db_session,
     SessionLocal,
-    WhatsAppGroup,
-    Flow,
-    FlowGroup,
-    FlowExecution,
-    KnowledgeBase,
-    ClientApiKey,
-    Workspace,
-    WorkspaceGroup,
-    WorkspaceFlow,
+    KnowledgeBaseSQLModel,
+    KnowledgeBaseRetrievalProfileSQLModel,
+    WorkspaceSQLModel,
+    FlowSQLModel,
+    WhatsAppGroupSQLModel,
+    WhatsAppContactSQLModel,
+    WorkspaceGroupSQLModel,
+    WorkspaceContactSQLModel,
+    WorkspaceFlowSQLModel,
+    FlowGroupSQLModel,
+    FlowExecutionSQLModel,
+    RAGEvalScorecardSQLModel,
+    RAGEvalCaseResultSQLModel,
 )
 from waha_client import waha_client
-from flow_engine import flow_engine
 from rag_utils import (
     create_qdrant_collection,
     get_collection_point_count,
     index_pdfs_to_collection,
     index_urls_to_collection,
     list_qdrant_collections,
+    DEFAULT_CHUNK_SIZE,
+    DEFAULT_CHUNK_OVERLAP,
 )
 
 # ============================================================================
@@ -217,6 +224,18 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def allow_private_network_preflight(request: Request, call_next):
+    """
+    Chrome blocks some cross-origin requests after successful OPTIONS preflight
+    unless Access-Control-Allow-Private-Network is present.
+    """
+    response = await call_next(request)
+    if request.headers.get("access-control-request-private-network") == "true":
+        response.headers["Access-Control-Allow-Private-Network"] = "true"
+    return response
+
+
 _workspace_flow_schema_ready = False
 RQ_WORKER_DESIRED_KEY = os.getenv("RQ_WORKER_DESIRED_KEY", "rq:workers:desired_count")
 RQ_WORKER_MANAGER_HEARTBEAT_KEY = os.getenv("RQ_WORKER_MANAGER_HEARTBEAT_KEY", "rq:workers:manager:heartbeat")
@@ -226,18 +245,67 @@ RQ_WORKER_DEFAULT_COUNT = min(
     RQ_WORKER_MAX_COUNT,
     max(RQ_WORKER_MIN_COUNT, int(os.getenv("RQ_WORKER_DEFAULT_COUNT", "1"))),
 )
-DIRECT_CHAT_MODEL = os.getenv("DIRECT_CHAT_MODEL", "gemini-2.5-flash")
-DIRECT_CHAT_TEMPERATURE = float(os.getenv("DIRECT_CHAT_TEMPERATURE", "0.3"))
-CLIENT_ID_SALT = os.getenv("CLIENT_ID_SALT", "async-rag-device-id")
-CLIENT_CHAT_API_KEY = os.getenv("CLIENT_CHAT_API_KEY", "").strip()
-CLIENT_CHAT_ADMIN_KEY = os.getenv("CLIENT_CHAT_ADMIN_KEY", "").strip()
-CLIENT_CHAT_API_KEY_SALT = os.getenv("CLIENT_CHAT_API_KEY_SALT", CLIENT_ID_SALT).strip() or CLIENT_ID_SALT
-CLIENT_CHAT_DEFAULT_PROMPT_TECHNIQUE = os.getenv("CLIENT_CHAT_DEFAULT_PROMPT_TECHNIQUE", "balanced").strip() or "balanced"
-CLIENT_CHAT_DAILY_LIMIT_PER_DEVICE = int(os.getenv("CLIENT_CHAT_DAILY_LIMIT_PER_DEVICE", "0"))
+INDEX_JOB_TTL_SECONDS = max(300, int(os.getenv("INDEX_JOB_TTL_SECONDS", "7200")))
+
+_index_jobs: Dict[str, Dict[str, Any]] = {}
+_index_jobs_lock = threading.Lock()
+
+
+def _utc_iso_now() -> str:
+    return datetime.utcnow().isoformat() + "Z"
+
+
+def _purge_stale_index_jobs_locked(now_ts: float) -> None:
+    stale_ids: List[str] = []
+    for job_id, payload in _index_jobs.items():
+        status = str(payload.get("status") or "").strip().lower()
+        updated_epoch = float(payload.get("updated_epoch") or 0.0)
+        if status in {"completed", "failed"} and (now_ts - updated_epoch) > INDEX_JOB_TTL_SECONDS:
+            stale_ids.append(job_id)
+    for stale_id in stale_ids:
+        _index_jobs.pop(stale_id, None)
+
+
+def _set_index_job(job_id: str, **updates: Any) -> Dict[str, Any]:
+    now_ts = time.time()
+    now_iso = _utc_iso_now()
+    with _index_jobs_lock:
+        _purge_stale_index_jobs_locked(now_ts)
+        current = dict(_index_jobs.get(job_id) or {})
+        previous_pct = float(current.get("progress_percent") or 0.0)
+        next_pct = updates.get("progress_percent")
+        if next_pct is not None:
+            try:
+                safe_pct = max(0.0, min(100.0, float(next_pct)))
+            except (TypeError, ValueError):
+                safe_pct = previous_pct
+            # Keep progress monotonic unless explicitly resetting for a new job state.
+            updates["progress_percent"] = max(previous_pct, safe_pct)
+        current.update(updates)
+        current["job_id"] = job_id
+        current["updated_at"] = now_iso
+        current["updated_epoch"] = now_ts
+        _index_jobs[job_id] = current
+        return dict(current)
+
+
+def _get_index_job(job_id: str) -> Optional[Dict[str, Any]]:
+    with _index_jobs_lock:
+        payload = _index_jobs.get(job_id)
+        return dict(payload) if payload else None
+
+
+def _public_index_job_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    public = dict(payload)
+    public.pop("updated_epoch", None)
+    public.pop("temp_dir", None)
+    public.pop("file_paths", None)
+    public.pop("urls", None)
+    return public
 
 
 def ensure_workspace_flow_schema(db: Session) -> None:
-    """Create workspace-flow mapping table and backfill legacy assignments."""
+    """Create runtime support tables and backfill legacy assignments."""
     global _workspace_flow_schema_ready
     if _workspace_flow_schema_ready:
         return
@@ -253,6 +321,114 @@ def ensure_workspace_flow_schema(db: Session) -> None:
     """))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_workspace_flows_workspace_id ON workspace_flows(workspace_id)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS idx_workspace_flows_flow_id ON workspace_flows(flow_id)"))
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS whatsapp_contacts (
+            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            chat_id VARCHAR(255) UNIQUE NOT NULL,
+            display_name VARCHAR(255),
+            phone_number VARCHAR(32),
+            waha_contact_id VARCHAR(255),
+            lid VARCHAR(255),
+            phone_jid VARCHAR(255),
+            source VARCHAR(30) NOT NULL DEFAULT 'webhook',
+            is_active BOOLEAN NOT NULL DEFAULT TRUE,
+            last_seen_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """))
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS workspace_contacts (
+            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            workspace_id UUID REFERENCES workspaces(id) ON DELETE CASCADE,
+            contact_id UUID REFERENCES whatsapp_contacts(id) ON DELETE CASCADE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(workspace_id, contact_id)
+        )
+    """))
+    db.execute(text("ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS contact_filter_mode VARCHAR(20) NOT NULL DEFAULT 'all'"))
+    db.execute(text("ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS low_quality_clarification_text TEXT"))
+    db.execute(text("ALTER TABLE whatsapp_contacts ADD COLUMN IF NOT EXISTS waha_contact_id VARCHAR(255)"))
+    db.execute(text("ALTER TABLE whatsapp_contacts ADD COLUMN IF NOT EXISTS lid VARCHAR(255)"))
+    db.execute(text("ALTER TABLE whatsapp_contacts ADD COLUMN IF NOT EXISTS phone_jid VARCHAR(255)"))
+
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS knowledge_base_retrieval_profiles (
+            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            knowledge_base_id UUID UNIQUE REFERENCES knowledge_bases(id) ON DELETE CASCADE,
+            final_context_k INTEGER,
+            retrieval_candidates INTEGER,
+            grounding_threshold DOUBLE PRECISION,
+            require_citations BOOLEAN,
+            min_context_chars INTEGER,
+            query_variants_limit INTEGER,
+            clarification_enabled BOOLEAN DEFAULT TRUE,
+            clarification_threshold DOUBLE PRECISION,
+            chunk_size INTEGER,
+            chunk_overlap INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """))
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS rag_eval_scorecards (
+            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            collection_name VARCHAR(255) NOT NULL,
+            knowledge_base_id UUID REFERENCES knowledge_bases(id) ON DELETE SET NULL,
+            total_cases INTEGER NOT NULL,
+            fallback_rate DOUBLE PRECISION NOT NULL,
+            citation_ok_rate DOUBLE PRECISION NOT NULL,
+            grounding_pass_rate DOUBLE PRECISION NOT NULL,
+            expectation_hit_rate DOUBLE PRECISION NOT NULL,
+            avg_latency_ms DOUBLE PRECISION NOT NULL,
+            rag_options JSONB,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """))
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS rag_eval_case_results (
+            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            scorecard_id UUID REFERENCES rag_eval_scorecards(id) ON DELETE CASCADE,
+            case_index INTEGER NOT NULL,
+            question TEXT NOT NULL,
+            answer TEXT NOT NULL,
+            expected_contains JSONB,
+            expectation_hit BOOLEAN NOT NULL,
+            fallback_used BOOLEAN NOT NULL,
+            citation_ok BOOLEAN NOT NULL,
+            grounding JSONB,
+            latency_ms DOUBLE PRECISION NOT NULL,
+            retrieved_chunks JSONB,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """))
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS conversation_long_term_memories (
+            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            client_id VARCHAR(255) NOT NULL,
+            memory_key VARCHAR(160) NOT NULL,
+            memory_text TEXT NOT NULL,
+            memory_category VARCHAR(50) NOT NULL DEFAULT 'general',
+            confidence DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+            source_message TEXT,
+            metadata JSONB,
+            hit_count INTEGER NOT NULL DEFAULT 1,
+            is_active BOOLEAN NOT NULL DEFAULT TRUE,
+            last_seen_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(client_id, memory_key)
+        )
+    """))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_kb_retrieval_profiles_kb_id ON knowledge_base_retrieval_profiles(knowledge_base_id)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_rag_eval_scorecards_collection ON rag_eval_scorecards(collection_name)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_rag_eval_case_results_scorecard ON rag_eval_case_results(scorecard_id)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_conversation_ltm_client ON conversation_long_term_memories(client_id)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_conversation_ltm_active ON conversation_long_term_memories(client_id, is_active)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_workspace_contacts_workspace_id ON workspace_contacts(workspace_id)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_workspace_contacts_contact_id ON workspace_contacts(contact_id)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_whatsapp_contacts_chat_id ON whatsapp_contacts(chat_id)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS idx_whatsapp_contacts_last_seen ON whatsapp_contacts(last_seen_at DESC)"))
 
     # Legacy support: migrate old single-owner mapping into reusable table.
     db.execute(text("""
@@ -264,55 +440,6 @@ def ensure_workspace_flow_schema(db: Session) -> None:
     """))
     db.commit()
     _workspace_flow_schema_ready = True
-
-
-def ensure_client_api_key_schema(db: Session) -> None:
-    """Create tenant API key table for public client chat auth/scoping."""
-    db.execute(text("""
-        CREATE OR REPLACE FUNCTION update_updated_at_column()
-        RETURNS TRIGGER AS $$
-        BEGIN
-            NEW.updated_at = CURRENT_TIMESTAMP;
-            RETURN NEW;
-        END;
-        $$ language 'plpgsql';
-    """))
-    db.execute(text("""
-        CREATE TABLE IF NOT EXISTS client_api_keys (
-            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-            name VARCHAR(120) UNIQUE NOT NULL,
-            description TEXT,
-            key_hash VARCHAR(128) UNIQUE NOT NULL,
-            key_prefix VARCHAR(24) NOT NULL,
-            allow_all_collections BOOLEAN DEFAULT FALSE,
-            allowed_collections JSONB DEFAULT '[]'::jsonb NOT NULL,
-            default_collection_name VARCHAR(255),
-            daily_limit_per_device INTEGER,
-            default_system_prompt TEXT,
-            default_user_prompt_template TEXT,
-            default_prompt_technique VARCHAR(40) DEFAULT 'balanced',
-            is_active BOOLEAN DEFAULT TRUE,
-            last_used_at TIMESTAMP,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """))
-    db.execute(text("ALTER TABLE client_api_keys ADD COLUMN IF NOT EXISTS daily_limit_per_device INTEGER"))
-    db.execute(text("ALTER TABLE client_api_keys ADD COLUMN IF NOT EXISTS default_system_prompt TEXT"))
-    db.execute(text("ALTER TABLE client_api_keys ADD COLUMN IF NOT EXISTS default_user_prompt_template TEXT"))
-    db.execute(text("ALTER TABLE client_api_keys ADD COLUMN IF NOT EXISTS default_prompt_technique VARCHAR(40) DEFAULT 'balanced'"))
-    db.execute(text("CREATE INDEX IF NOT EXISTS idx_client_api_keys_active ON client_api_keys(is_active)"))
-    db.execute(text("CREATE INDEX IF NOT EXISTS idx_client_api_keys_name ON client_api_keys(name)"))
-    db.execute(text("""
-        DROP TRIGGER IF EXISTS update_client_api_keys_updated_at ON client_api_keys
-    """))
-    db.execute(text("""
-        CREATE TRIGGER update_client_api_keys_updated_at
-        BEFORE UPDATE ON client_api_keys
-        FOR EACH ROW
-        EXECUTE FUNCTION update_updated_at_column()
-    """))
-    db.commit()
 
 
 def _model_dump(payload: BaseModel) -> Dict[str, Any]:
@@ -333,35 +460,42 @@ def _parse_workspace_uuid_list(raw_values: List[str]) -> List[uuid.UUID]:
     return parsed
 
 
-def _get_flow_workspace_usage(db: Session, flows: List[Flow]) -> Dict[uuid.UUID, List[Dict[str, str]]]:
+def _get_flow_workspace_usage(db: Session, flows: List[Any]) -> Dict[uuid.UUID, List[Dict[str, str]]]:
     usage: Dict[uuid.UUID, List[Dict[str, str]]] = {flow.id: [] for flow in flows}
     flow_ids = [flow.id for flow in flows]
     if not flow_ids:
         return usage
 
-    rows = (
-        db.query(WorkspaceFlow.flow_id, Workspace.id, Workspace.name)
-        .join(Workspace, Workspace.id == WorkspaceFlow.workspace_id)
-        .filter(WorkspaceFlow.flow_id.in_(flow_ids))
-        .order_by(Workspace.name.asc())
-        .all()
-    )
+    rows = db.execute(
+        select(WorkspaceFlowSQLModel.flow_id, WorkspaceSQLModel.id, WorkspaceSQLModel.name)
+        .join(WorkspaceSQLModel, WorkspaceSQLModel.id == WorkspaceFlowSQLModel.workspace_id)
+        .where(WorkspaceFlowSQLModel.flow_id.in_(flow_ids))
+        .order_by(WorkspaceSQLModel.name.asc())
+    ).all()
     for flow_id, workspace_id, workspace_name in rows:
         usage.setdefault(flow_id, []).append(
             {"id": str(workspace_id), "name": workspace_name}
         )
 
     # Fallback for older rows not backfilled yet.
+    legacy_workspace_ids = [flow.workspace_id for flow in flows if getattr(flow, "workspace_id", None)]
+    workspace_name_by_id: Dict[uuid.UUID, str] = {}
+    if legacy_workspace_ids:
+        legacy_rows = db.execute(
+            select(WorkspaceSQLModel.id, WorkspaceSQLModel.name).where(WorkspaceSQLModel.id.in_(legacy_workspace_ids))
+        ).all()
+        workspace_name_by_id = {workspace_id: workspace_name for workspace_id, workspace_name in legacy_rows}
+
     for flow in flows:
         if usage.get(flow.id):
             continue
-        if flow.workspace_id and flow.workspace:
-            usage[flow.id] = [{"id": str(flow.workspace_id), "name": flow.workspace.name}]
+        if flow.workspace_id and flow.workspace_id in workspace_name_by_id:
+            usage[flow.id] = [{"id": str(flow.workspace_id), "name": workspace_name_by_id[flow.workspace_id]}]
 
     return usage
 
 
-def _serialize_flow(flow: Flow, workspace_links: List[Dict[str, str]]) -> Dict[str, Any]:
+def _serialize_flow(flow: Any, workspace_links: List[Dict[str, str]]) -> Dict[str, Any]:
     workspace_ids = [link["id"] for link in workspace_links]
     workspace_names = [link["name"] for link in workspace_links]
     return {
@@ -381,14 +515,131 @@ def _serialize_flow(flow: Flow, workspace_links: List[Dict[str, str]]) -> Dict[s
 
 
 def _attach_flow_to_workspace(db: Session, workspace_uuid: uuid.UUID, flow_uuid: uuid.UUID) -> bool:
-    existing = db.query(WorkspaceFlow).filter(
-        WorkspaceFlow.workspace_id == workspace_uuid,
-        WorkspaceFlow.flow_id == flow_uuid,
-    ).first()
+    existing = db.execute(
+        select(WorkspaceFlowSQLModel).where(
+            WorkspaceFlowSQLModel.workspace_id == workspace_uuid,
+            WorkspaceFlowSQLModel.flow_id == flow_uuid,
+        )
+    ).scalars().first()
     if existing:
         return False
-    db.add(WorkspaceFlow(workspace_id=workspace_uuid, flow_id=flow_uuid))
+    db.add(WorkspaceFlowSQLModel(workspace_id=workspace_uuid, flow_id=flow_uuid))
     return True
+
+
+def _waha_headers() -> Dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    api_key = str(os.getenv("WAHA_API_KEY", "Yahoo") or "").strip()
+    if api_key:
+        headers["X-Api-Key"] = api_key
+    return headers
+
+
+def _waha_target() -> Dict[str, str]:
+    return {
+        "base_url": str(os.getenv("WAHA_URL", "http://waha:3000")).rstrip("/"),
+        "session": str(os.getenv("WAHA_SESSION", "default") or "default").strip() or "default",
+    }
+
+
+def _waha_bootstrap_webhooks(session_name: str) -> List[Dict[str, Any]]:
+    webhook_url = str(
+        os.getenv("WAHA_WEBHOOK_URL", f"http://server:8000/whatsapp/webhook?waha_instance={session_name}")
+    ).strip()
+    if not webhook_url:
+        return []
+    return [{"url": webhook_url, "events": ["session.status", "message"]}]
+
+
+def _waha_desired_start_payload(session_name: str) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "name": session_name,
+        "config": {
+            "noweb": {
+                "store": {
+                    "enabled": True,
+                    "fullSync": True,
+                }
+            }
+        },
+    }
+    webhooks = _waha_bootstrap_webhooks(session_name)
+    if webhooks:
+        payload["config"]["webhooks"] = webhooks
+    return payload
+
+
+def _ensure_waha_store_bootstrap() -> None:
+    """
+    Ensure WAHA default session is started with NOWEB store enabled.
+    Safe behavior:
+    - If session is missing or stopped -> start with required config.
+    - If already running with wrong config -> warn only (no forced disconnect).
+    """
+    if str(os.getenv("WAHA_BOOTSTRAP_SESSION", "true")).strip().lower() not in {"1", "true", "yes", "on"}:
+        return
+
+    target = _waha_target()
+    base_url = target["base_url"]
+    session_name = target["session"]
+    headers = _waha_headers()
+
+    try:
+        sessions_resp = requests.get(
+            f"{base_url}/api/sessions",
+            params={"all": "true"},
+            headers=headers,
+            timeout=20,
+        )
+        sessions_resp.raise_for_status()
+        sessions = sessions_resp.json() if sessions_resp.content else []
+    except Exception as exc:
+        logger.warning("WAHA bootstrap skipped: unable to query sessions (%s)", exc)
+        return
+
+    existing = None
+    if isinstance(sessions, list):
+        existing = next((item for item in sessions if str(item.get("name") or "") == session_name), None)
+
+    existing_config = existing.get("config") if isinstance(existing, dict) else None
+    existing_noweb = (existing_config or {}).get("noweb") if isinstance(existing_config, dict) else {}
+    existing_store = existing_noweb.get("store") if isinstance(existing_noweb, dict) else {}
+    store_enabled = bool((existing_store or {}).get("enabled"))
+    full_sync_enabled = bool((existing_store or {}).get("fullSync"))
+    status = str((existing or {}).get("status") or "").strip().upper()
+
+    if status in {"WORKING", "STARTING", "CONNECTING", "SCAN_QR_CODE"} and (not store_enabled or not full_sync_enabled):
+        logger.warning(
+            "WAHA session '%s' is active with store config disabled (enabled=%s fullSync=%s). "
+            "Restart/recreate session to apply store settings.",
+            session_name,
+            store_enabled,
+            full_sync_enabled,
+        )
+        return
+
+    if status in {"WORKING", "STARTING", "CONNECTING", "SCAN_QR_CODE"}:
+        return
+
+    payload = _waha_desired_start_payload(session_name)
+    try:
+        start_resp = requests.post(
+            f"{base_url}/api/sessions/start",
+            headers=headers,
+            json=payload,
+            timeout=30,
+        )
+        if start_resp.status_code not in {200, 201, 202}:
+            logger.warning(
+                "WAHA bootstrap start failed for session '%s': status=%s body=%s",
+                session_name,
+                start_resp.status_code,
+                start_resp.text[:500],
+            )
+            return
+        logger.info("WAHA bootstrap started session '%s' with NOWEB store enabled", session_name)
+    except Exception as exc:
+        logger.warning("WAHA bootstrap start error for session '%s': %s", session_name, exc)
 
 
 @app.on_event("startup")
@@ -396,11 +647,11 @@ def startup_workspace_flow_schema() -> None:
     db = SessionLocal()
     try:
         ensure_workspace_flow_schema(db)
-        ensure_client_api_key_schema(db)
     except Exception as exc:
         print(f"⚠️ startup schema setup skipped: {exc}")
     finally:
         db.close()
+    _ensure_waha_store_bootstrap()
 
 # WebSocket handle karne wali class
 class ConnectionManager:
@@ -437,694 +688,33 @@ class ChatRequest(BaseModel):
     query: str
     client_id: Optional[str] = None
     message_id: Optional[str] = None
-
-
-class ClientChatRequest(BaseModel):
-    message: str
-    client_id: Optional[str] = None
     collection_name: Optional[str] = None
-    client_system: Optional[str] = None
-    device_fingerprint: Optional[str] = None
-    conversation_limit: int = Field(default=6, ge=1, le=20)
-    clear_history: bool = False
+
+
+class RAGEvalCase(BaseModel):
+    question: str = Field(min_length=1, max_length=5000)
+    expected_contains: List[str] = Field(default_factory=list)
+
+
+class RAGEvalRequest(BaseModel):
+    collection_name: str = Field(min_length=1, max_length=255)
+    cases: List[RAGEvalCase] = Field(default_factory=list)
+    conversation_history: Optional[str] = ""
     system_prompt: Optional[str] = None
     user_prompt_template: Optional[str] = None
-    prompt_technique: Optional[str] = None
-    temperature: Optional[float] = Field(default=None, ge=0.0, le=2.0)
-    max_output_tokens: Optional[int] = Field(default=768, ge=64, le=8192)
+    rag_options: Optional[Dict[str, Any]] = None
 
 
-class ClientApiKeyCreateRequest(BaseModel):
-    name: str = Field(min_length=3, max_length=120)
-    description: Optional[str] = None
-    allow_all_collections: bool = False
-    allowed_collections: List[str] = Field(default_factory=list)
-    default_collection_name: Optional[str] = None
-    daily_limit_per_device: Optional[int] = Field(default=None, ge=0, le=1000000)
-    default_system_prompt: Optional[str] = None
-    default_user_prompt_template: Optional[str] = None
-    default_prompt_technique: Optional[str] = None
-    is_active: bool = True
+class ExecutionBulkDeleteRequest(BaseModel):
+    execution_ids: List[str] = Field(default_factory=list)
 
 
-class ClientApiKeyUpdateRequest(BaseModel):
-    name: Optional[str] = Field(default=None, min_length=3, max_length=120)
-    description: Optional[str] = None
-    allow_all_collections: Optional[bool] = None
-    allowed_collections: Optional[List[str]] = None
-    default_collection_name: Optional[str] = None
-    daily_limit_per_device: Optional[int] = Field(default=None, ge=0, le=1000000)
-    default_system_prompt: Optional[str] = None
-    default_user_prompt_template: Optional[str] = None
-    default_prompt_technique: Optional[str] = None
+class MemoryLTMUpdate(BaseModel):
+    memory_key: str = Field(min_length=1, max_length=160)
+    memory_text: Optional[str] = Field(default=None, min_length=1, max_length=4000)
+    memory_category: Optional[str] = Field(default=None, min_length=1, max_length=50)
+    confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     is_active: Optional[bool] = None
-    rotate_key: bool = False
-
-
-# WhatsApp webhook models
-class WhatsAppPayload(BaseModel):
-    chatId: str
-    id: str
-    body: Optional[str] = ""
-    mentionedIds: Optional[List[str]] = []
-
-
-class WAHAWebhook(BaseModel):
-    payload: WhatsAppPayload
-
-
-def _resolve_request_ip(request: Request) -> str:
-    forwarded_for = (request.headers.get("x-forwarded-for") or "").strip()
-    if forwarded_for:
-        return forwarded_for.split(",")[0].strip()
-    real_ip = (request.headers.get("x-real-ip") or "").strip()
-    if real_ip:
-        return real_ip
-    if request.client and request.client.host:
-        return str(request.client.host).strip()
-    return "0.0.0.0"
-
-
-def _infer_client_system(user_agent: str, explicit_system: Optional[str]) -> str:
-    manual = (explicit_system or "").strip()
-    if manual:
-        return manual[:120]
-
-    ua = (user_agent or "").lower()
-    if "windows" in ua:
-        return "windows"
-    if "android" in ua:
-        return "android"
-    if "iphone" in ua or "ipad" in ua or "ios" in ua:
-        return "ios"
-    if "mac os" in ua or "macintosh" in ua:
-        return "macos"
-    if "linux" in ua:
-        return "linux"
-    return "unknown"
-
-
-def _derive_device_client_id(
-    request: Request,
-    explicit_system: Optional[str] = None,
-    device_fingerprint: Optional[str] = None,
-) -> str:
-    ip_addr = _resolve_request_ip(request)
-    user_agent = (request.headers.get("user-agent") or "").strip()
-    system_label = _infer_client_system(user_agent, explicit_system)
-    fingerprint = (device_fingerprint or "").strip()
-    payload = f"{ip_addr}|{system_label}|{user_agent}|{fingerprint}"
-    digest = hmac.new(
-        key=CLIENT_ID_SALT.encode("utf-8"),
-        msg=payload.encode("utf-8"),
-        digestmod=hashlib.sha256,
-    ).hexdigest()
-    return f"dev_{digest[:32]}"
-
-
-def _hash_client_api_key(raw_key: str) -> str:
-    return hashlib.sha256(f"{CLIENT_CHAT_API_KEY_SALT}:{raw_key}".encode("utf-8")).hexdigest()
-
-
-def _generate_client_api_key() -> str:
-    return f"ck_live_{secrets.token_urlsafe(24)}"
-
-
-def _normalize_collection_scope(raw_items: Optional[List[str]]) -> List[str]:
-    normalized: List[str] = []
-    seen = set()
-    for item in raw_items or []:
-        value = (item or "").strip()
-        if not value or value in seen:
-            continue
-        seen.add(value)
-        normalized.append(value)
-    return normalized
-
-
-def _validate_allowed_collections(allowed_collections: List[str]) -> None:
-    if not allowed_collections:
-        return
-    known = set(list_qdrant_collections())
-    unknown = [name for name in allowed_collections if name not in known]
-    if unknown:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unknown collection(s): {', '.join(unknown)}",
-        )
-
-
-def _serialize_client_api_key_record(record: ClientApiKey) -> Dict[str, Any]:
-    return {
-        "id": str(record.id),
-        "name": record.name,
-        "description": record.description,
-        "key_prefix": record.key_prefix,
-        "allow_all_collections": bool(record.allow_all_collections),
-        "allowed_collections": list(record.allowed_collections or []),
-        "default_collection_name": record.default_collection_name,
-        "daily_limit_per_device": record.daily_limit_per_device,
-        "default_system_prompt": record.default_system_prompt,
-        "default_user_prompt_template": record.default_user_prompt_template,
-        "default_prompt_technique": _normalize_prompt_technique(record.default_prompt_technique),
-        "is_active": bool(record.is_active),
-        "last_used_at": record.last_used_at.isoformat() if record.last_used_at else None,
-        "created_at": record.created_at.isoformat() if record.created_at else None,
-        "updated_at": record.updated_at.isoformat() if record.updated_at else None,
-    }
-
-
-def _touch_client_api_key_usage(db: Session, record: ClientApiKey) -> None:
-    record.last_used_at = datetime.utcnow()
-    db.add(record)
-    db.flush()
-
-
-def _require_client_chat_admin_key(request: Request) -> None:
-    admin_header = (request.headers.get("x-client-admin-key") or "").strip()
-    api_header = (request.headers.get("x-client-api-key") or "").strip()
-
-    if CLIENT_CHAT_ADMIN_KEY:
-        if hmac.compare_digest(admin_header, CLIENT_CHAT_ADMIN_KEY):
-            return
-        raise HTTPException(status_code=401, detail="Invalid or missing X-Client-Admin-Key")
-
-    if CLIENT_CHAT_API_KEY:
-        if hmac.compare_digest(api_header, CLIENT_CHAT_API_KEY):
-            return
-        raise HTTPException(
-            status_code=401,
-            detail="Admin key not configured. Use global X-Client-Api-Key for management.",
-        )
-
-
-def _resolve_client_chat_auth_context(request: Request, db: Session) -> Dict[str, Any]:
-    provided_key = (request.headers.get("x-client-api-key") or "").strip()
-    active_tenant_count = db.query(ClientApiKey).filter(ClientApiKey.is_active.is_(True)).count()
-    auth_required = bool(CLIENT_CHAT_API_KEY) or active_tenant_count > 0
-
-    if provided_key:
-        if CLIENT_CHAT_API_KEY and hmac.compare_digest(provided_key, CLIENT_CHAT_API_KEY):
-            return {"mode": "global", "auth_required": auth_required, "tenant_key": None}
-
-        key_hash = _hash_client_api_key(provided_key)
-        tenant_key = db.query(ClientApiKey).filter(
-            ClientApiKey.key_hash == key_hash,
-            ClientApiKey.is_active.is_(True),
-        ).first()
-        if tenant_key:
-            _touch_client_api_key_usage(db, tenant_key)
-            return {"mode": "tenant", "auth_required": auth_required, "tenant_key": tenant_key}
-        if not auth_required:
-            # Open mode: ignore stale/unknown key headers to keep local UX forgiving.
-            return {"mode": "open", "auth_required": False, "tenant_key": None}
-        raise HTTPException(status_code=401, detail="Invalid X-Client-Api-Key")
-
-    if auth_required:
-        raise HTTPException(status_code=401, detail="Missing X-Client-Api-Key")
-
-    return {"mode": "open", "auth_required": False, "tenant_key": None}
-
-
-def _normalize_prompt_technique(raw_value: Optional[str]) -> str:
-    value = (raw_value or "").strip().lower()
-    allowed = {"balanced", "concise", "detailed", "strict_context", "socratic"}
-    if value in allowed:
-        return value
-    return "balanced"
-
-
-def _resolve_effective_prompt_technique(
-    requested: Optional[str],
-    auth_context: Dict[str, Any],
-) -> str:
-    tenant_key = auth_context.get("tenant_key")
-    if requested:
-        return _normalize_prompt_technique(requested)
-    if tenant_key and getattr(tenant_key, "default_prompt_technique", None):
-        return _normalize_prompt_technique(tenant_key.default_prompt_technique)
-    return _normalize_prompt_technique(CLIENT_CHAT_DEFAULT_PROMPT_TECHNIQUE)
-
-
-def _resolve_effective_system_prompt(
-    requested: Optional[str],
-    auth_context: Dict[str, Any],
-) -> Optional[str]:
-    provided = (requested or "").strip()
-    if provided:
-        return provided
-    tenant_key = auth_context.get("tenant_key")
-    fallback = (getattr(tenant_key, "default_system_prompt", "") or "").strip() if tenant_key else ""
-    return fallback or None
-
-
-def _resolve_effective_user_prompt_template(
-    requested: Optional[str],
-    auth_context: Dict[str, Any],
-) -> Optional[str]:
-    provided = (requested or "").strip()
-    if provided:
-        return provided
-    tenant_key = auth_context.get("tenant_key")
-    fallback = (getattr(tenant_key, "default_user_prompt_template", "") or "").strip() if tenant_key else ""
-    return fallback or None
-
-
-def _build_prompt_replacements(message: str, conversation_history: str, collection_name: Optional[str]) -> Dict[str, str]:
-    return {
-        "{{message}}": message,
-        "{{body}}": message,
-        "{{query}}": message,
-        "{{conversation_history}}": conversation_history or "",
-        "{{collection_name}}": collection_name or "",
-    }
-
-
-def _apply_replacements(template_text: str, replacements: Dict[str, str]) -> str:
-    output = template_text
-    for key, value in replacements.items():
-        output = output.replace(key, value)
-    return output
-
-
-def _apply_prompt_technique(user_payload: str, technique: str) -> str:
-    clean_payload = user_payload.strip()
-    if technique == "concise":
-        return (
-            "Respond with high signal and minimal fluff. "
-            "Prefer bullets where useful and keep it short.\n\n"
-            f"{clean_payload}"
-        )
-    if technique == "detailed":
-        return (
-            "Provide a structured, complete answer with clear sections, examples, and caveats.\n\n"
-            f"{clean_payload}"
-        )
-    if technique == "strict_context":
-        return (
-            "Use only the provided context/data. If data is missing, explicitly say what is missing.\n\n"
-            f"{clean_payload}"
-        )
-    if technique == "socratic":
-        return (
-            "Answer directly and include one clarifying question if user intent is ambiguous.\n\n"
-            f"{clean_payload}"
-        )
-    return clean_payload
-
-
-def _build_effective_user_prompt(
-    message: str,
-    conversation_history: str,
-    technique: str,
-    user_prompt_template: Optional[str],
-    collection_name: Optional[str],
-) -> str:
-    replacements = _build_prompt_replacements(message, conversation_history, collection_name)
-    template = (user_prompt_template or "").strip() or "{{query}}"
-    filled = _apply_replacements(template, replacements).strip() or message
-    return _apply_prompt_technique(filled, technique)
-
-
-def _get_daily_limit_for_context(auth_context: Dict[str, Any]) -> int:
-    tenant_key = auth_context.get("tenant_key")
-    if tenant_key and getattr(tenant_key, "daily_limit_per_device", None):
-        return int(tenant_key.daily_limit_per_device)
-    return max(0, int(CLIENT_CHAT_DAILY_LIMIT_PER_DEVICE))
-
-
-def _build_rate_scope_id(auth_context: Dict[str, Any]) -> str:
-    mode = auth_context.get("mode") or "open"
-    tenant_key = auth_context.get("tenant_key")
-    if mode == "tenant" and tenant_key:
-        return f"tenant:{tenant_key.id}"
-    return mode
-
-
-def _resolve_rate_identity(request: Request, explicit_system: Optional[str]) -> str:
-    ip_addr = _resolve_request_ip(request)
-    user_agent = (request.headers.get("user-agent") or "").strip()
-    system_label = _infer_client_system(user_agent, explicit_system)
-    raw = f"{ip_addr}|{system_label}"
-    digest = hashlib.sha1(raw.encode("utf-8"), usedforsecurity=False).hexdigest()
-    return digest
-
-
-def _seconds_until_utc_day_end() -> int:
-    now = datetime.utcnow()
-    tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-    return max(60, int((tomorrow - now).total_seconds()))
-
-
-_memory_rate_counter: Dict[str, int] = {}
-
-
-def _enforce_daily_rate_limit(
-    request: Request,
-    auth_context: Dict[str, Any],
-    explicit_system: Optional[str],
-) -> Dict[str, Any]:
-    limit = _get_daily_limit_for_context(auth_context)
-    if limit <= 0:
-        return {"enabled": False, "limit": 0, "used": 0, "remaining": None, "scope": _build_rate_scope_id(auth_context)}
-
-    day_key = datetime.utcnow().strftime("%Y%m%d")
-    scope_id = _build_rate_scope_id(auth_context)
-    identity = _resolve_rate_identity(request, explicit_system)
-    redis_key = f"chat_rate:{scope_id}:{day_key}:{identity}"
-
-    used = 0
-    expires_in = _seconds_until_utc_day_end()
-    redis_client = queue.connection
-    try:
-        if redis_client:
-            used = int(redis_client.incr(redis_key))
-            if used == 1:
-                redis_client.expire(redis_key, expires_in + 60)
-        else:
-            raise RuntimeError("No redis connection")
-    except Exception:
-        used = _memory_rate_counter.get(redis_key, 0) + 1
-        _memory_rate_counter[redis_key] = used
-
-    if used > limit:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Daily device rate limit exceeded ({limit}/day).",
-        )
-
-    remaining = max(0, limit - used)
-    reset_at = (datetime.utcnow() + timedelta(seconds=expires_in)).replace(microsecond=0).isoformat() + "Z"
-    return {
-        "enabled": True,
-        "limit": limit,
-        "used": used,
-        "remaining": remaining,
-        "scope": scope_id,
-        "reset_at": reset_at,
-    }
-
-
-def _generate_direct_chat_response(
-    query: str,
-    conversation_history: str = "",
-    system_prompt: Optional[str] = None,
-    temperature: Optional[float] = None,
-    max_output_tokens: Optional[int] = None,
-) -> str:
-    from google import genai
-    from google.genai import types
-
-    conversation_block = ""
-    if conversation_history:
-        conversation_block = f"\n\nRecent Conversation:\n{conversation_history}"
-
-    default_system_prompt = (
-        "You are a helpful, concise assistant for a production web application. "
-        "Answer clearly, avoid hallucinations, and state assumptions when needed."
-        f"{conversation_block}"
-    )
-    effective_system_prompt = (system_prompt or "").strip() or default_system_prompt
-    effective_temperature = DIRECT_CHAT_TEMPERATURE if temperature is None else float(temperature)
-
-    client = genai.Client()
-    response = client.models.generate_content(
-        model=DIRECT_CHAT_MODEL,
-        contents=query,
-        config=types.GenerateContentConfig(
-            system_instruction=effective_system_prompt,
-            temperature=effective_temperature,
-            max_output_tokens=max_output_tokens,
-        ),
-    )
-    result = (response.text or "").strip()
-    if not result:
-        raise ValueError("Model returned an empty response")
-    return result
-
-
-def _iter_direct_chat_response_chunks(
-    query: str,
-    conversation_history: str = "",
-    system_prompt: Optional[str] = None,
-    temperature: Optional[float] = None,
-    max_output_tokens: Optional[int] = None,
-):
-    from google import genai
-    from google.genai import types
-
-    conversation_block = ""
-    if conversation_history:
-        conversation_block = f"\n\nRecent Conversation:\n{conversation_history}"
-
-    default_system_prompt = (
-        "You are a helpful, concise assistant for a production web application. "
-        "Answer clearly, avoid hallucinations, and state assumptions when needed."
-        f"{conversation_block}"
-    )
-    effective_system_prompt = (system_prompt or "").strip() or default_system_prompt
-    effective_temperature = DIRECT_CHAT_TEMPERATURE if temperature is None else float(temperature)
-
-    client = genai.Client()
-    emitted_any = False
-    stream = client.models.generate_content_stream(
-        model=DIRECT_CHAT_MODEL,
-        contents=query,
-        config=types.GenerateContentConfig(
-            system_instruction=effective_system_prompt,
-            temperature=effective_temperature,
-            max_output_tokens=max_output_tokens,
-        ),
-    )
-
-    for chunk in stream:
-        chunk_text = getattr(chunk, "text", None)
-        if not chunk_text:
-            continue
-        emitted_any = True
-        yield chunk_text
-
-    if emitted_any:
-        return
-
-    # Safety fallback: if upstream stream returns empty pieces.
-    fallback = _generate_direct_chat_response(
-        query=query,
-        conversation_history=conversation_history,
-        system_prompt=system_prompt,
-        temperature=temperature,
-        max_output_tokens=max_output_tokens,
-    )
-    if fallback:
-        yield fallback
-
-
-def _format_sse_event(event_name: str, data: Dict[str, Any]) -> str:
-    return f"event: {event_name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
-
-
-def _normalize_collection_name(raw_name: Optional[str]) -> Optional[str]:
-    clean = (raw_name or "").strip()
-    return clean or None
-
-
-def _filter_collections_by_scope(all_collections: List[str], auth_context: Dict[str, Any]) -> List[str]:
-    tenant_key = auth_context.get("tenant_key")
-    if not tenant_key:
-        return list(all_collections)
-    if tenant_key.allow_all_collections:
-        return list(all_collections)
-    allowed = set(_normalize_collection_scope(list(tenant_key.allowed_collections or [])))
-    return [name for name in all_collections if name in allowed]
-
-
-def _resolve_effective_collection_name(
-    requested_collection_name: Optional[str],
-    available_collections: List[str],
-    auth_context: Dict[str, Any],
-) -> Optional[str]:
-    selected_collection_name = _normalize_collection_name(requested_collection_name)
-    tenant_key = auth_context.get("tenant_key")
-
-    if selected_collection_name and selected_collection_name not in available_collections:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Knowledge space '{selected_collection_name}' not found",
-        )
-
-    if not tenant_key:
-        return selected_collection_name
-
-    if not selected_collection_name:
-        fallback = _normalize_collection_name(tenant_key.default_collection_name)
-        if fallback and fallback in available_collections:
-            selected_collection_name = fallback
-
-    if tenant_key.allow_all_collections:
-        return selected_collection_name
-
-    allowed = set(_normalize_collection_scope(list(tenant_key.allowed_collections or [])))
-    if not selected_collection_name and tenant_key.default_collection_name:
-        # default exists but was not in available_collections; keep direct mode fallback.
-        return None
-    if selected_collection_name and selected_collection_name not in allowed:
-        raise HTTPException(
-            status_code=403,
-            detail=f"API key does not allow collection '{selected_collection_name}'",
-        )
-    return selected_collection_name
-
-
-def _build_client_chat_docs_payload(
-    base_url: str,
-    selected_collection_name: Optional[str],
-    available_collections: List[str],
-    auth_context: Dict[str, Any],
-) -> Dict[str, Any]:
-    tenant_key = auth_context.get("tenant_key")
-    auth_mode = auth_context.get("mode") or "open"
-    auth_required = bool(auth_context.get("auth_required"))
-    docs_collection_name = selected_collection_name or "<your-knowledge-space>"
-    request_collection_line = f'    "collection_name": "{docs_collection_name}",\n'
-    api_key_header_line = (
-        "\n  -H \"X-Client-Api-Key: <your-client-api-key>\""
-        if auth_required
-        else ""
-    )
-    js_api_key_header = (
-        "      \"X-Client-Api-Key\": \"<your-client-api-key>\",\n"
-        if auth_required
-        else ""
-    )
-    widget_api_key_header = (
-        "      'X-Client-Api-Key': '<your-client-api-key>',\n"
-        if auth_required
-        else ""
-    )
-
-    curl_example = (
-        f"curl -X POST \"{base_url}/api/chat/respond\" \\\n"
-        f"  -H \"Content-Type: application/json\"{api_key_header_line} \\\n"
-        "  -d '{\n"
-        "    \"message\": \"Hi, explain your platform in 3 bullets\",\n"
-        f"{request_collection_line}"
-        "    \"client_system\": \"web\",\n"
-        "    \"device_fingerprint\": \"browser-fingerprint-v1\"\n"
-        "  }'"
-    )
-
-    javascript_example = (
-        f"const API_BASE_URL = \"{base_url}\";\n"
-        "async function sendMessage(message) {\n"
-        "  const response = await fetch(`${API_BASE_URL}/api/chat/respond`, {\n"
-        "    method: \"POST\",\n"
-        "    headers: {\n"
-        "      \"Content-Type\": \"application/json\",\n"
-        f"{js_api_key_header}"
-        "    },\n"
-        "    body: JSON.stringify({\n"
-        "      message,\n"
-        f"      collection_name: \"{docs_collection_name}\",\n"
-        "      client_system: navigator.platform || \"web\",\n"
-        "      device_fingerprint: [navigator.userAgent, navigator.language, Intl.DateTimeFormat().resolvedOptions().timeZone].join(\"|\")\n"
-        "    })\n"
-        "  });\n"
-        "  if (!response.ok) throw new Error(`Chat request failed: ${response.status}`);\n"
-        "  return response.json();\n"
-        "}"
-    )
-
-    html_widget_template = (
-        "<div id=\"async-rag-chat-widget\">\n"
-        "  <input id=\"rag-input\" placeholder=\"Ask anything\" />\n"
-        "  <button id=\"rag-send\">Send</button>\n"
-        "  <pre id=\"rag-output\"></pre>\n"
-        "</div>\n"
-        "<script>\n"
-        f"const API_BASE_URL = \"{base_url}\";\n"
-        "document.getElementById('rag-send').onclick = async () => {\n"
-        "  const message = document.getElementById('rag-input').value.trim();\n"
-        "  if (!message) return;\n"
-        "  const res = await fetch(`${API_BASE_URL}/api/chat/respond`, {\n"
-        "    method: 'POST',\n"
-        "    headers: {\n"
-        "      'Content-Type': 'application/json',\n"
-        f"{widget_api_key_header}"
-        "    },\n"
-        "    body: JSON.stringify({\n"
-        "      message,\n"
-        f"      collection_name: '{docs_collection_name}',\n"
-        "      client_system: navigator.platform || 'web',\n"
-        "      device_fingerprint: [navigator.userAgent, navigator.language].join('|')\n"
-        "    })\n"
-        "  });\n"
-        "  const data = await res.json();\n"
-        "  document.getElementById('rag-output').textContent = data.reply || data.detail || 'No response';\n"
-        "};\n"
-        "</script>"
-    )
-
-    sse_javascript_example = (
-        f"const API_BASE_URL = \"{base_url}\";\n"
-        "async function streamChat(message) {\n"
-        "  const response = await fetch(`${API_BASE_URL}/api/chat/respond/stream`, {\n"
-        "    method: \"POST\",\n"
-        "    headers: {\n"
-        "      \"Content-Type\": \"application/json\",\n"
-        f"{js_api_key_header}"
-        "    },\n"
-        "    body: JSON.stringify({\n"
-        "      message,\n"
-        f"      collection_name: \"{docs_collection_name}\",\n"
-        "      prompt_technique: \"balanced\"\n"
-        "    })\n"
-        "  });\n"
-        "  const reader = response.body.getReader();\n"
-        "  const decoder = new TextDecoder();\n"
-        "  let buffer = \"\";\n"
-        "  while (true) {\n"
-        "    const { done, value } = await reader.read();\n"
-        "    if (done) break;\n"
-        "    buffer += decoder.decode(value, { stream: true });\n"
-        "    const events = buffer.split(\"\\n\\n\");\n"
-        "    buffer = events.pop() || \"\";\n"
-        "    for (const rawEvent of events) {\n"
-        "      const line = rawEvent.split(\"\\n\").find((entry) => entry.startsWith(\"data: \"));\n"
-        "      if (!line) continue;\n"
-        "      const payload = JSON.parse(line.slice(6));\n"
-        "      if (payload.text) console.log(payload.text);\n"
-        "    }\n"
-        "  }\n"
-        "}\n"
-    )
-
-    return {
-        "status": "success",
-        "base_url": base_url,
-        "endpoint": "/api/chat/respond",
-        "stream_endpoint": "/api/chat/respond/stream",
-        "method": "POST",
-        "active_collection_name": selected_collection_name,
-        "available_collections": available_collections,
-        "auth": {
-            "header": "X-Client-Api-Key",
-            "required": auth_required,
-            "mode": auth_mode,
-        },
-        "scope": {
-            "allow_all_collections": bool(tenant_key.allow_all_collections) if tenant_key else True,
-            "allowed_collections": _normalize_collection_scope(list(tenant_key.allowed_collections or [])) if tenant_key else [],
-            "default_collection_name": tenant_key.default_collection_name if tenant_key else None,
-            "key_name": tenant_key.name if tenant_key else None,
-            "daily_limit_per_device": tenant_key.daily_limit_per_device if tenant_key else (CLIENT_CHAT_DAILY_LIMIT_PER_DEVICE or None),
-            "default_prompt_technique": _normalize_prompt_technique(getattr(tenant_key, "default_prompt_technique", None)) if tenant_key else _normalize_prompt_technique(CLIENT_CHAT_DEFAULT_PROMPT_TECHNIQUE),
-        },
-        "supported_prompt_techniques": ["balanced", "concise", "detailed", "strict_context", "socratic"],
-        "curl_example": curl_example,
-        "javascript_example": javascript_example,
-        "sse_javascript_example": sse_javascript_example,
-        "html_widget_template": html_widget_template,
-    }
 
 
 @app.get("/")
@@ -1137,6 +727,11 @@ async def whatsapp_webhook(request: Request):
     """WhatsApp webhook fast-ack + async queue processing."""
     try:
         data = await request.json()
+        waha_instance = (
+            request.query_params.get("waha_instance")
+            or request.query_params.get("instance")
+            or data.get("session")
+        )
         print(f"📩 Naya message aaya: {json.dumps(data, indent=2)}")
         
         # WAHA kabhi kabhi redundant events bhejta hai
@@ -1150,6 +745,7 @@ async def whatsapp_webhook(request: Request):
         payload["_waha"] = {
             "event": data.get("event"),
             "session": data.get("session"),
+            "instance": waha_instance,
             "engine": data.get("engine"),
             "timestamp": data.get("timestamp"),
             "id": data.get("id"),
@@ -1161,10 +757,9 @@ async def whatsapp_webhook(request: Request):
             payload["chatId"] = payload.get("from")
         if "message_id" not in payload and payload.get("id"):
             payload["message_id"] = payload.get("id")
-        if _should_ingest_conversation_message(payload):
-            history_client_id = _resolve_whatsapp_client_id(payload)
-            conversation_manager.add_message(history_client_id, "user", str(payload.get("body") or "").strip())
-            payload["_conversation_ingested"] = True
+        # Memory ingestion is handled in worker webhook job so it can use canonical
+        # contact identity mapping before writing STM/LTM keys.
+        payload["_conversation_ingested"] = False
 
         # Full async: webhook just queues, worker does heavy processing.
         job_id = payload.get("message_id") or payload.get("id")
@@ -1205,7 +800,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
     try:
         while True:
             # Keep connection alive and listen for any client messages
-            data = await websocket.receive_text()
+            await websocket.receive_text()
             await websocket.send_json({"type": "ack", "message": "Message received"})
     except WebSocketDisconnect:
         manager.disconnect(client_id)
@@ -1216,30 +811,58 @@ def chat(
     request: ChatRequest = None,
     query: Optional[str] = Query(None),
     client_id: Optional[str] = Query(None),
-    message_id: Optional[str] = Query(None)
+    message_id: Optional[str] = Query(None),
+    collection_name: Optional[str] = Query(None),
 ):
     # Support both JSON body and query parameters
     if request:
         query = request.query
         client_id = request.client_id
         message_id = request.message_id
+        collection_name = request.collection_name
     
     if not query:
         return {"error": "query parameter is required"}, 422
+
+    resolved_collection_name = (collection_name or os.getenv("DEFAULT_QDRANT_COLLECTION", "").strip() or "").strip()
+    if not resolved_collection_name:
+        return {
+            "error": "collection_name is required when DEFAULT_QDRANT_COLLECTION is not configured"
+        }, 422
     
     
     # Store user's message in conversation history
     if client_id:
         conversation_manager.add_message(client_id, "user", query)
         
-        # Get conversation history
-        conversation_history = conversation_manager.get_context_string(client_id)
+        # Build query-aware context: recent turns + summary + relevant past turns + LTM.
+        context_limit = max(6, int(os.getenv("CHAT_CONTEXT_TURN_LIMIT", "24")))
+        context_token_budget = max(250, int(os.getenv("STM_CONTEXT_TOKEN_BUDGET", "1200")))
+        conversation_history = conversation_manager.get_context_string(
+            client_id,
+            limit=context_limit,
+            query=query,
+            token_budget=context_token_budget,
+        )
     else:
         conversation_history = ""
     
-    # Enqueue job with conversation history and message_id
-    job = queue.enqueue(process_query, query, client_id, conversation_history, message_id)
-    return {"status": "queued", "job_id": job.id, "client_id": client_id, "message_id": message_id}
+    # Enqueue with keyword arguments to avoid positional-argument drift bugs.
+    job = queue.enqueue(
+        process_query,
+        query=query,
+        client_id=client_id,
+        conversation_history=conversation_history,
+        whatsapp_message_id=message_id,
+        collection_name=resolved_collection_name,
+    )
+    return {
+        "status": "queued",
+        "job_id": job.id,
+        "client_id": client_id,
+        "message_id": message_id,
+        "collection_name": resolved_collection_name,
+    }
 
 
 @app.get("/job-status")
@@ -1284,421 +907,344 @@ def clear_conversation(client_id: str):
     return {"status": "cleared", "client_id": client_id}
 
 
-@app.post("/api/chat/respond")
-def client_chat_respond(
-    payload: ClientChatRequest,
-    request: Request,
-    db: Session = Depends(get_db_session),
+@app.get("/api/memory/{client_id}")
+def get_memory_debug_snapshot(
+    client_id: str,
+    query: Optional[str] = Query(default=""),
+    history_limit: int = Query(default=24, ge=1, le=200),
+    token_budget: int = Query(default=1200, ge=120, le=8000),
+    ltm_limit: int = Query(default=50, ge=1, le=400),
+    include_inactive: bool = Query(default=False),
+    workspace_id: Optional[str] = Query(default=None),
+    memory_scope: Optional[str] = Query(default=None),
 ):
-    """Synchronous chat API for client websites/apps."""
-    auth_context = _resolve_client_chat_auth_context(request, db)
-    rate_limit_info = _enforce_daily_rate_limit(request, auth_context, payload.client_system)
-
-    message = (payload.message or "").strip()
-    if not message:
-        raise HTTPException(status_code=422, detail="`message` is required")
-
-    provided_client_id = (payload.client_id or "").strip()
-    all_collections = list_qdrant_collections()
-    selected_collection_name = _resolve_effective_collection_name(
-        requested_collection_name=payload.collection_name,
-        available_collections=all_collections,
-        auth_context=auth_context,
+    snapshot = conversation_manager.get_memory_debug_snapshot(
+        client_id=client_id,
+        query=query or "",
+        history_limit=history_limit,
+        token_budget=token_budget,
+        ltm_limit=ltm_limit,
+        include_inactive=include_inactive,
+        workspace_id=workspace_id,
+        memory_scope=memory_scope,
     )
-    resolved_client_id = provided_client_id or _derive_device_client_id(
-        request=request,
-        explicit_system=payload.client_system,
-        device_fingerprint=payload.device_fingerprint,
-    )
-    strategy = "provided" if provided_client_id else "derived_ip_system"
-
-    if payload.clear_history:
-        conversation_manager.clear_history(resolved_client_id)
-
-    conversation_manager.add_message(resolved_client_id, "user", message)
-    conversation_history = conversation_manager.get_context_string(
-        resolved_client_id,
-        limit=payload.conversation_limit,
-    )
-    prompt_technique = _resolve_effective_prompt_technique(payload.prompt_technique, auth_context)
-    effective_system_prompt = _resolve_effective_system_prompt(payload.system_prompt, auth_context)
-    effective_user_prompt_template = _resolve_effective_user_prompt_template(payload.user_prompt_template, auth_context)
-    effective_user_prompt = _build_effective_user_prompt(
-        message=message,
-        conversation_history=conversation_history,
-        technique=prompt_technique,
-        user_prompt_template=effective_user_prompt_template,
-        collection_name=selected_collection_name,
-    )
-
-    try:
-        if selected_collection_name:
-            # Reuse existing RAG pipeline with selected knowledge space.
-            reply = process_query(
-                query=message,
-                client_id=resolved_client_id,
-                conversation_history=conversation_history,
-                collection_name=selected_collection_name,
-                system_prompt=effective_system_prompt,
-                user_prompt_template=effective_user_prompt,
-                emit_side_effects=False,
-            )
-            response_mode = "rag"
-        else:
-            reply = _generate_direct_chat_response(
-                query=effective_user_prompt,
-                conversation_history=conversation_history,
-                system_prompt=effective_system_prompt,
-                temperature=payload.temperature,
-                max_output_tokens=payload.max_output_tokens,
-            )
-            response_mode = "direct"
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Direct chat failed: {e}")
-
-    conversation_manager.add_message(resolved_client_id, "assistant", reply)
-
-    return {
-        "status": "success",
-        "reply": reply,
-        "client_id": resolved_client_id,
-        "client_id_strategy": strategy,
-        "response_mode": response_mode,
-        "collection_name": selected_collection_name,
-        "prompt_technique": prompt_technique,
-        "rate_limit": rate_limit_info,
-        "model": DIRECT_CHAT_MODEL,
-        "timestamp": datetime.now().isoformat(),
-    }
+    return {"status": "success", **snapshot}
 
 
-@app.post("/api/chat/respond/stream")
-def client_chat_respond_stream(
-    payload: ClientChatRequest,
-    request: Request,
-    db: Session = Depends(get_db_session),
+@app.patch("/api/memory/{client_id}/ltm")
+def upsert_memory_ltm(
+    client_id: str,
+    payload: MemoryLTMUpdate,
+    workspace_id: Optional[str] = Query(default=None),
+    memory_scope: Optional[str] = Query(default=None),
 ):
-    """SSE streaming chat API for client websites/apps."""
-    auth_context = _resolve_client_chat_auth_context(request, db)
-    rate_limit_info = _enforce_daily_rate_limit(request, auth_context, payload.client_system)
+    memory_key = str(payload.memory_key or "").strip()
+    if not memory_key:
+        raise HTTPException(status_code=422, detail="memory_key is required")
 
-    message = (payload.message or "").strip()
-    if not message:
-        raise HTTPException(status_code=422, detail="`message` is required")
-
-    provided_client_id = (payload.client_id or "").strip()
-    all_collections = list_qdrant_collections()
-    selected_collection_name = _resolve_effective_collection_name(
-        requested_collection_name=payload.collection_name,
-        available_collections=all_collections,
-        auth_context=auth_context,
+    existing_items = conversation_manager.list_long_term_memories(
+        client_id=client_id,
+        include_inactive=True,
+        limit=1000,
+        workspace_id=workspace_id,
+        memory_scope=memory_scope,
     )
-    resolved_client_id = provided_client_id or _derive_device_client_id(
-        request=request,
-        explicit_system=payload.client_system,
-        device_fingerprint=payload.device_fingerprint,
-    )
-    strategy = "provided" if provided_client_id else "derived_ip_system"
+    existing_by_key = {str(item.get("memory_key") or ""): item for item in existing_items}
+    existing = existing_by_key.get(memory_key)
 
-    if payload.clear_history:
-        conversation_manager.clear_history(resolved_client_id)
+    effective_text = str(payload.memory_text or "").strip()
+    if not effective_text:
+        if not existing:
+            raise HTTPException(status_code=404, detail=f"memory_key not found: {memory_key}")
+        effective_text = str(existing.get("memory_text") or "").strip()
+        if not effective_text:
+            raise HTTPException(status_code=422, detail="memory_text is required for new memory item")
 
-    conversation_manager.add_message(resolved_client_id, "user", message)
-    conversation_history = conversation_manager.get_context_string(
-        resolved_client_id,
-        limit=payload.conversation_limit,
-    )
-    prompt_technique = _resolve_effective_prompt_technique(payload.prompt_technique, auth_context)
-    effective_system_prompt = _resolve_effective_system_prompt(payload.system_prompt, auth_context)
-    effective_user_prompt_template = _resolve_effective_user_prompt_template(payload.user_prompt_template, auth_context)
-    effective_user_prompt = _build_effective_user_prompt(
-        message=message,
-        conversation_history=conversation_history,
-        technique=prompt_technique,
-        user_prompt_template=effective_user_prompt_template,
-        collection_name=selected_collection_name,
-    )
+    effective_category = payload.memory_category
+    if effective_category is None and existing:
+        effective_category = str(existing.get("memory_category") or "general")
 
-    def event_stream():
-        final_reply_parts: List[str] = []
-        response_mode = "rag" if selected_collection_name else "direct"
-        yield _format_sse_event(
-            "meta",
-            {
-                "status": "streaming",
-                "client_id": resolved_client_id,
-                "client_id_strategy": strategy,
-                "response_mode": response_mode,
-                "collection_name": selected_collection_name,
-                "prompt_technique": prompt_technique,
-                "rate_limit": rate_limit_info,
-                "model": DIRECT_CHAT_MODEL,
-                "timestamp": datetime.utcnow().isoformat() + "Z",
-            },
-        )
-        try:
-            if selected_collection_name:
-                rag_reply = process_query(
-                    query=message,
-                    client_id=resolved_client_id,
-                    conversation_history=conversation_history,
-                    collection_name=selected_collection_name,
-                    system_prompt=effective_system_prompt,
-                    user_prompt_template=effective_user_prompt,
-                    emit_side_effects=False,
-                )
-                chunk_size = 180
-                for i in range(0, len(rag_reply), chunk_size):
-                    chunk = rag_reply[i : i + chunk_size]
-                    if not chunk:
-                        continue
-                    final_reply_parts.append(chunk)
-                    yield _format_sse_event("token", {"text": chunk})
-            else:
-                for chunk in _iter_direct_chat_response_chunks(
-                    query=effective_user_prompt,
-                    conversation_history=conversation_history,
-                    system_prompt=effective_system_prompt,
-                    temperature=payload.temperature,
-                    max_output_tokens=payload.max_output_tokens,
-                ):
-                    if not chunk:
-                        continue
-                    final_reply_parts.append(chunk)
-                    yield _format_sse_event("token", {"text": chunk})
+    effective_confidence = payload.confidence
+    if effective_confidence is None and existing and existing.get("confidence") is not None:
+        effective_confidence = float(existing.get("confidence"))
 
-            full_reply = "".join(final_reply_parts).strip()
-            if not full_reply:
-                raise ValueError("Model returned empty stream")
-            conversation_manager.add_message(resolved_client_id, "assistant", full_reply)
-            yield _format_sse_event(
-                "done",
-                {
-                    "status": "success",
-                    "reply": full_reply,
-                    "client_id": resolved_client_id,
-                    "client_id_strategy": strategy,
-                    "response_mode": response_mode,
-                    "collection_name": selected_collection_name,
-                    "prompt_technique": prompt_technique,
-                    "rate_limit": rate_limit_info,
-                    "model": DIRECT_CHAT_MODEL,
-                    "timestamp": datetime.utcnow().isoformat() + "Z",
-                },
-            )
-        except Exception as exc:
-            yield _format_sse_event("error", {"status": "error", "detail": str(exc)})
-
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
-
-
-@app.get("/api/chat/docs")
-def get_client_chat_docs(
-    request: Request,
-    collection_name: Optional[str] = Query(default=None),
-    db: Session = Depends(get_db_session),
-):
-    """Return quick integration docs/templates for client websites."""
-    auth_context = _resolve_client_chat_auth_context(request, db)
-    base_url = str(request.base_url).rstrip("/")
-    all_collections = list_qdrant_collections()
-    available_collections = _filter_collections_by_scope(all_collections, auth_context)
-    selected_collection_name = _resolve_effective_collection_name(
-        requested_collection_name=collection_name,
-        available_collections=all_collections,
-        auth_context=auth_context,
-    )
-    return _build_client_chat_docs_payload(
-        base_url=base_url,
-        selected_collection_name=selected_collection_name,
-        available_collections=available_collections,
-        auth_context=auth_context,
-    )
-
-
-@app.get("/api/chat/keys")
-def list_client_api_keys(request: Request, db: Session = Depends(get_db_session)):
-    _require_client_chat_admin_key(request)
-    records = db.query(ClientApiKey).order_by(ClientApiKey.created_at.desc()).all()
-    return {
-        "status": "success",
-        "total": len(records),
-        "keys": [_serialize_client_api_key_record(record) for record in records],
-    }
-
-
-@app.post("/api/chat/keys")
-def create_client_api_key(
-    payload: ClientApiKeyCreateRequest,
-    request: Request,
-    db: Session = Depends(get_db_session),
-):
-    _require_client_chat_admin_key(request)
-    clean_name = payload.name.strip()
-    if len(clean_name) < 3:
-        raise HTTPException(status_code=400, detail="name must be at least 3 visible characters")
-
-    allowed_collections = _normalize_collection_scope(payload.allowed_collections)
-    default_collection_name = _normalize_collection_name(payload.default_collection_name)
-    default_prompt_technique = _normalize_prompt_technique(payload.default_prompt_technique)
-    default_system_prompt = (payload.default_system_prompt or "").strip() or None
-    default_user_prompt_template = (payload.default_user_prompt_template or "").strip() or None
-    daily_limit_per_device = payload.daily_limit_per_device
-    if daily_limit_per_device is not None and int(daily_limit_per_device) <= 0:
-        daily_limit_per_device = None
-
-    if not payload.allow_all_collections:
-        if not allowed_collections and not default_collection_name:
-            raise HTTPException(
-                status_code=400,
-                detail="Provide allowed_collections or a default_collection_name when allow_all_collections is false",
-            )
-        _validate_allowed_collections(allowed_collections)
-        if default_collection_name:
-            _validate_allowed_collections([default_collection_name])
-            if allowed_collections and default_collection_name not in allowed_collections:
-                raise HTTPException(
-                    status_code=400,
-                    detail="default_collection_name must be included in allowed_collections",
-                )
-    elif default_collection_name:
-        _validate_allowed_collections([default_collection_name])
-
-    existing_name = db.query(ClientApiKey).filter(ClientApiKey.name == clean_name).first()
-    if existing_name:
-        raise HTTPException(status_code=409, detail="A key with this name already exists")
-
-    raw_key = _generate_client_api_key()
-    key_prefix = raw_key[:18]
-    record = ClientApiKey(
-        name=clean_name,
-        description=(payload.description or "").strip() or None,
-        key_hash=_hash_client_api_key(raw_key),
-        key_prefix=key_prefix,
-        allow_all_collections=payload.allow_all_collections,
-        allowed_collections=allowed_collections if not payload.allow_all_collections else [],
-        default_collection_name=default_collection_name,
-        daily_limit_per_device=daily_limit_per_device,
-        default_system_prompt=default_system_prompt,
-        default_user_prompt_template=default_user_prompt_template,
-        default_prompt_technique=default_prompt_technique,
+    updated_item = conversation_manager.upsert_long_term_memory(
+        client_id=client_id,
+        memory_key=memory_key,
+        memory_text=effective_text,
+        memory_category=effective_category,
+        confidence=effective_confidence,
         is_active=payload.is_active,
+        workspace_id=workspace_id,
+        memory_scope=memory_scope,
     )
-    db.add(record)
-    db.commit()
-    db.refresh(record)
-
     return {
         "status": "success",
-        "api_key": raw_key,
-        "key": _serialize_client_api_key_record(record),
+        "client_id": client_id,
+        "workspace_id": workspace_id,
+        "memory_scope": memory_scope or conversation_manager.get_default_memory_scope(),
+        "item": updated_item,
     }
 
 
-@app.patch("/api/chat/keys/{key_id}")
-def update_client_api_key(
-    key_id: str,
-    payload: ClientApiKeyUpdateRequest,
-    request: Request,
+@app.delete("/api/memory/{client_id}/ltm")
+def deactivate_memory_ltm(
+    client_id: str,
+    memory_key: str = Query(..., min_length=1, max_length=160),
+    workspace_id: Optional[str] = Query(default=None),
+    memory_scope: Optional[str] = Query(default=None),
+):
+    success = conversation_manager.deactivate_long_term_memory(
+        client_id=client_id,
+        memory_key=memory_key,
+        workspace_id=workspace_id,
+        memory_scope=memory_scope,
+    )
+    if not success:
+        raise HTTPException(status_code=404, detail=f"Active memory not found: {memory_key}")
+    return {
+        "status": "success",
+        "client_id": client_id,
+        "memory_key": memory_key,
+        "message": "Memory deactivated",
+    }
+
+
+@app.delete("/api/memory/{client_id}")
+def clear_memory_for_client(
+    client_id: str,
+    workspace_id: Optional[str] = Query(default=None),
+    memory_scope: Optional[str] = Query(default=None),
+):
+    conversation_manager.clear_history(
+        client_id,
+        workspace_id=workspace_id,
+        memory_scope=memory_scope,
+    )
+    return {
+        "status": "success",
+        "client_id": client_id,
+        "workspace_id": workspace_id,
+        "memory_scope": memory_scope or conversation_manager.get_default_memory_scope(),
+        "message": "Conversation history and long-term memory cleared",
+    }
+
+
+@app.post("/api/rag/evaluate")
+def evaluate_rag_quality(payload: RAGEvalRequest, db: Session = Depends(get_db_session)):
+    """Run a lightweight grounded-RAG evaluation set and return aggregated metrics."""
+    collection_name = (payload.collection_name or "").strip()
+    if not collection_name:
+        raise HTTPException(status_code=422, detail="`collection_name` is required")
+    if not payload.cases:
+        raise HTTPException(status_code=422, detail="`cases` must contain at least one question")
+
+    available = set(list_qdrant_collections())
+    if collection_name not in available:
+        raise HTTPException(status_code=404, detail=f"Collection not found: {collection_name}")
+
+    case_results: List[Dict[str, Any]] = []
+    fallback_count = 0
+    citation_ok_count = 0
+    grounded_pass_count = 0
+    expectation_hit_count = 0
+    total_latency_ms = 0.0
+
+    for idx, case in enumerate(payload.cases, start=1):
+        started = time.perf_counter()
+        debug_result = process_query(
+            query=case.question,
+            client_id=None,
+            conversation_history=payload.conversation_history or "",
+            whatsapp_message_id=None,
+            collection_name=collection_name,
+            system_prompt=payload.system_prompt,
+            user_prompt_template=payload.user_prompt_template,
+            emit_side_effects=False,
+            return_debug=True,
+            rag_options=payload.rag_options or {},
+        )
+        latency_ms = round((time.perf_counter() - started) * 1000, 2)
+        total_latency_ms += latency_ms
+
+        answer = str(debug_result.get("answer") or "")
+        fallback_used = bool(debug_result.get("fallback_used"))
+        citation_ok = bool(debug_result.get("citation_ok"))
+        grounded_pass = bool((debug_result.get("grounding") or {}).get("passed"))
+
+        if fallback_used:
+            fallback_count += 1
+        if citation_ok:
+            citation_ok_count += 1
+        if grounded_pass:
+            grounded_pass_count += 1
+
+        expected_contains = [item.strip() for item in (case.expected_contains or []) if item and item.strip()]
+        expectation_hit = True
+        answer_lower = answer.lower()
+        for expected_fragment in expected_contains:
+            if expected_fragment.lower() not in answer_lower:
+                expectation_hit = False
+                break
+        if expectation_hit:
+            expectation_hit_count += 1
+
+        case_results.append(
+            {
+                "index": idx,
+                "question": case.question,
+                "answer": answer,
+                "expected_contains": expected_contains,
+                "expectation_hit": expectation_hit,
+                "fallback_used": fallback_used,
+                "citation_ok": citation_ok,
+                "grounding": debug_result.get("grounding") or {},
+                "latency_ms": latency_ms,
+                "retrieved_chunks": debug_result.get("retrieved_chunks") or [],
+            }
+        )
+
+    total_cases = len(payload.cases)
+    avg_latency_ms = round(total_latency_ms / max(1, total_cases), 2)
+
+    summary = {
+        "total_cases": total_cases,
+        "fallback_rate": round(fallback_count / total_cases, 4),
+        "citation_ok_rate": round(citation_ok_count / total_cases, 4),
+        "grounding_pass_rate": round(grounded_pass_count / total_cases, 4),
+        "expectation_hit_rate": round(expectation_hit_count / total_cases, 4),
+        "avg_latency_ms": avg_latency_ms,
+    }
+
+    kb = db.execute(
+        select(KnowledgeBaseSQLModel).where(KnowledgeBaseSQLModel.name == collection_name)
+    ).scalars().first()
+    scorecard = RAGEvalScorecardSQLModel(
+        collection_name=collection_name,
+        knowledge_base_id=kb.id if kb else None,
+        total_cases=summary["total_cases"],
+        fallback_rate=summary["fallback_rate"],
+        citation_ok_rate=summary["citation_ok_rate"],
+        grounding_pass_rate=summary["grounding_pass_rate"],
+        expectation_hit_rate=summary["expectation_hit_rate"],
+        avg_latency_ms=summary["avg_latency_ms"],
+        rag_options=payload.rag_options or {},
+    )
+    db.add(scorecard)
+    db.flush()
+
+    for case_result in case_results:
+        db.add(
+            RAGEvalCaseResultSQLModel(
+                scorecard_id=scorecard.id,
+                case_index=case_result["index"],
+                question=case_result["question"],
+                answer=case_result["answer"],
+                expected_contains=case_result["expected_contains"],
+                expectation_hit=bool(case_result["expectation_hit"]),
+                fallback_used=bool(case_result["fallback_used"]),
+                citation_ok=bool(case_result["citation_ok"]),
+                grounding=case_result.get("grounding") or {},
+                latency_ms=float(case_result["latency_ms"]),
+                retrieved_chunks=case_result.get("retrieved_chunks") or [],
+            )
+        )
+    db.commit()
+
+    return {
+        "status": "success",
+        "collection_name": collection_name,
+        "scorecard_id": str(scorecard.id),
+        "summary": summary,
+        "results": case_results,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+    }
+
+
+@app.get("/api/rag/scorecards")
+def list_rag_scorecards(
+    collection_name: Optional[str] = Query(default=None),
+    limit: int = Query(default=20, ge=1, le=200),
     db: Session = Depends(get_db_session),
 ):
-    _require_client_chat_admin_key(request)
+    query = select(RAGEvalScorecardSQLModel).order_by(RAGEvalScorecardSQLModel.created_at.desc())
+    if collection_name:
+        query = query.where(RAGEvalScorecardSQLModel.collection_name == collection_name.strip())
+    scorecards = db.execute(query.limit(limit)).scalars().all()
+    return {
+        "status": "success",
+        "count": len(scorecards),
+        "scorecards": [
+            {
+                "id": str(card.id),
+                "collection_name": card.collection_name,
+                "knowledge_base_id": str(card.knowledge_base_id) if card.knowledge_base_id else None,
+                "total_cases": card.total_cases,
+                "fallback_rate": card.fallback_rate,
+                "citation_ok_rate": card.citation_ok_rate,
+                "grounding_pass_rate": card.grounding_pass_rate,
+                "expectation_hit_rate": card.expectation_hit_rate,
+                "avg_latency_ms": card.avg_latency_ms,
+                "rag_options": card.rag_options or {},
+                "created_at": card.created_at.isoformat() if card.created_at else None,
+            }
+            for card in scorecards
+        ],
+    }
+
+
+@app.get("/api/rag/scorecards/{scorecard_id}")
+def get_rag_scorecard(scorecard_id: str, db: Session = Depends(get_db_session)):
     try:
-        key_uuid = uuid.UUID(str(key_id))
+        scorecard_uuid = uuid.UUID(scorecard_id)
     except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid API key id format")
+        raise HTTPException(status_code=400, detail="Invalid scorecard id")
 
-    record = db.query(ClientApiKey).filter(ClientApiKey.id == key_uuid).first()
-    if not record:
-        raise HTTPException(status_code=404, detail="API key not found")
+    scorecard = db.execute(
+        select(RAGEvalScorecardSQLModel).where(RAGEvalScorecardSQLModel.id == scorecard_uuid)
+    ).scalars().first()
+    if not scorecard:
+        raise HTTPException(status_code=404, detail="Scorecard not found")
 
-    if payload.name is not None:
-        next_name = payload.name.strip()
-        if not next_name:
-            raise HTTPException(status_code=400, detail="name cannot be empty")
-        name_conflict = db.query(ClientApiKey).filter(
-            ClientApiKey.name == next_name,
-            ClientApiKey.id != record.id,
-        ).first()
-        if name_conflict:
-            raise HTTPException(status_code=409, detail="Another key already uses this name")
-        record.name = next_name
+    cases = db.execute(
+        select(RAGEvalCaseResultSQLModel)
+        .where(RAGEvalCaseResultSQLModel.scorecard_id == scorecard.id)
+        .order_by(RAGEvalCaseResultSQLModel.case_index.asc())
+    ).scalars().all()
 
-    if payload.description is not None:
-        record.description = (payload.description or "").strip() or None
-    if payload.is_active is not None:
-        record.is_active = payload.is_active
-    if payload.allow_all_collections is not None:
-        record.allow_all_collections = payload.allow_all_collections
-
-    if payload.allowed_collections is not None:
-        normalized_scope = _normalize_collection_scope(payload.allowed_collections)
-        _validate_allowed_collections(normalized_scope)
-        record.allowed_collections = normalized_scope
-
-    if payload.default_collection_name is not None:
-        next_default = _normalize_collection_name(payload.default_collection_name)
-        if next_default:
-            _validate_allowed_collections([next_default])
-        record.default_collection_name = next_default
-
-    if payload.daily_limit_per_device is not None:
-        record.daily_limit_per_device = None if payload.daily_limit_per_device <= 0 else payload.daily_limit_per_device
-    if payload.default_system_prompt is not None:
-        record.default_system_prompt = (payload.default_system_prompt or "").strip() or None
-    if payload.default_user_prompt_template is not None:
-        record.default_user_prompt_template = (payload.default_user_prompt_template or "").strip() or None
-    if payload.default_prompt_technique is not None:
-        record.default_prompt_technique = _normalize_prompt_technique(payload.default_prompt_technique)
-
-    if not record.allow_all_collections:
-        allowed_scope = set(_normalize_collection_scope(list(record.allowed_collections or [])))
-        if record.default_collection_name and record.default_collection_name not in allowed_scope:
-            raise HTTPException(
-                status_code=400,
-                detail="default_collection_name must be included in allowed_collections when allow_all_collections is false",
-            )
-
-    rotated_api_key: Optional[str] = None
-    if payload.rotate_key:
-        rotated_api_key = _generate_client_api_key()
-        record.key_hash = _hash_client_api_key(rotated_api_key)
-        record.key_prefix = rotated_api_key[:18]
-
-    db.add(record)
-    db.commit()
-    db.refresh(record)
-
-    response: Dict[str, Any] = {"status": "success", "key": _serialize_client_api_key_record(record)}
-    if rotated_api_key:
-        response["api_key"] = rotated_api_key
-    return response
-
-
-@app.delete("/api/chat/keys/{key_id}")
-def delete_client_api_key(key_id: str, request: Request, db: Session = Depends(get_db_session)):
-    _require_client_chat_admin_key(request)
-    try:
-        key_uuid = uuid.UUID(str(key_id))
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid API key id format")
-
-    record = db.query(ClientApiKey).filter(ClientApiKey.id == key_uuid).first()
-    if not record:
-        raise HTTPException(status_code=404, detail="API key not found")
-    db.delete(record)
-    db.commit()
-    return {"status": "success", "deleted_id": str(key_uuid)}
+    return {
+        "status": "success",
+        "scorecard": {
+            "id": str(scorecard.id),
+            "collection_name": scorecard.collection_name,
+            "knowledge_base_id": str(scorecard.knowledge_base_id) if scorecard.knowledge_base_id else None,
+            "total_cases": scorecard.total_cases,
+            "fallback_rate": scorecard.fallback_rate,
+            "citation_ok_rate": scorecard.citation_ok_rate,
+            "grounding_pass_rate": scorecard.grounding_pass_rate,
+            "expectation_hit_rate": scorecard.expectation_hit_rate,
+            "avg_latency_ms": scorecard.avg_latency_ms,
+            "rag_options": scorecard.rag_options or {},
+            "created_at": scorecard.created_at.isoformat() if scorecard.created_at else None,
+        },
+        "cases": [
+            {
+                "id": str(case.id),
+                "index": case.case_index,
+                "question": case.question,
+                "answer": case.answer,
+                "expected_contains": case.expected_contains or [],
+                "expectation_hit": case.expectation_hit,
+                "fallback_used": case.fallback_used,
+                "citation_ok": case.citation_ok,
+                "grounding": case.grounding or {},
+                "latency_ms": case.latency_ms,
+                "retrieved_chunks": case.retrieved_chunks or [],
+                "created_at": case.created_at.isoformat() if case.created_at else None,
+            }
+            for case in cases
+        ],
+    }
 
 
 class WorkerScaleUpdate(BaseModel):
@@ -1712,6 +1258,131 @@ def _clamp_worker_count(raw_value: int) -> int:
 def _safe_webhook_job_id(message_id: str) -> str:
     digest = hashlib.sha1(str(message_id).encode("utf-8"), usedforsecurity=False).hexdigest()
     return f"webhook_{digest}"
+
+
+_CONTACT_FILTER_MODES = {"all", "only", "except"}
+
+
+def _normalize_contact_chat_id(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if "@" in raw:
+        return raw.lower()
+
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) < 8:
+        return ""
+    return f"{digits}@s.whatsapp.net"
+
+
+def _extract_phone_number(chat_id: str) -> str:
+    base = str(chat_id or "").split("@", 1)[0]
+    digits = re.sub(r"\D", "", base)
+    return digits
+
+
+def _resolve_contact_filter_mode(raw_mode: Any) -> str:
+    normalized = str(raw_mode or "all").strip().lower()
+    if normalized not in _CONTACT_FILTER_MODES:
+        raise HTTPException(status_code=422, detail="contact_filter_mode must be one of: all, only, except")
+    return normalized
+
+
+def _upsert_contact_by_chat_id(
+    db: Session,
+    chat_id: str,
+    display_name: Optional[str] = None,
+    source: str = "manual",
+    waha_contact_id: Optional[str] = None,
+    lid: Optional[str] = None,
+    phone_jid: Optional[str] = None,
+) -> Optional[WhatsAppContactSQLModel]:
+    normalized_chat_id = _normalize_contact_chat_id(chat_id)
+    normalized_waha_contact_id = _normalize_contact_chat_id(waha_contact_id) or None
+    normalized_lid = _normalize_contact_chat_id(lid) or None
+    normalized_phone_jid = _normalize_contact_chat_id(phone_jid) or None
+
+    if not normalized_chat_id:
+        normalized_chat_id = normalized_lid or normalized_phone_jid or normalized_waha_contact_id
+    if not normalized_chat_id or "@g.us" in normalized_chat_id:
+        return None
+
+    lookup_conditions = [WhatsAppContactSQLModel.chat_id == normalized_chat_id]
+    # If caller provides only one id format (manual add by lid/phone/c.us),
+    # still match existing rows that stored that value in mapped columns.
+    if normalized_chat_id.endswith("@lid"):
+        lookup_conditions.append(WhatsAppContactSQLModel.lid == normalized_chat_id)
+    if normalized_chat_id.endswith("@s.whatsapp.net"):
+        lookup_conditions.append(WhatsAppContactSQLModel.phone_jid == normalized_chat_id)
+    if normalized_chat_id.endswith("@c.us"):
+        lookup_conditions.append(WhatsAppContactSQLModel.waha_contact_id == normalized_chat_id)
+
+    if normalized_waha_contact_id:
+        lookup_conditions.append(WhatsAppContactSQLModel.chat_id == normalized_waha_contact_id)
+    if normalized_lid:
+        lookup_conditions.append(WhatsAppContactSQLModel.chat_id == normalized_lid)
+    if normalized_phone_jid:
+        lookup_conditions.append(WhatsAppContactSQLModel.chat_id == normalized_phone_jid)
+    if normalized_waha_contact_id:
+        lookup_conditions.append(WhatsAppContactSQLModel.waha_contact_id == normalized_waha_contact_id)
+    if normalized_lid:
+        lookup_conditions.append(WhatsAppContactSQLModel.lid == normalized_lid)
+    if normalized_phone_jid:
+        lookup_conditions.append(WhatsAppContactSQLModel.phone_jid == normalized_phone_jid)
+
+    now = datetime.now()
+    display_value = str(display_name or "").strip() or None
+    phone_base = normalized_phone_jid or normalized_chat_id
+    phone_value = _extract_phone_number(phone_base) or None
+    if phone_value and len(phone_value) >= 8:
+        lookup_conditions.append(WhatsAppContactSQLModel.phone_number == phone_value)
+    contact = db.execute(
+        select(WhatsAppContactSQLModel).where(or_(*lookup_conditions))
+    ).scalars().first()
+
+    if contact:
+        if display_value and (not contact.display_name or str(contact.display_name).strip().isdigit()):
+            contact.display_name = display_value
+        contact.phone_number = phone_value or contact.phone_number
+        contact.waha_contact_id = normalized_waha_contact_id or (str(contact.waha_contact_id or "").strip() or None)
+        contact.lid = normalized_lid or (str(contact.lid or "").strip() or None)
+        contact.phone_jid = normalized_phone_jid or (str(contact.phone_jid or "").strip() or None)
+        contact.source = source or contact.source
+        contact.last_seen_at = now
+        contact.is_active = True
+        return contact
+
+    canonical_chat_id = normalized_lid or normalized_phone_jid or normalized_waha_contact_id or normalized_chat_id
+    contact = WhatsAppContactSQLModel(
+        chat_id=canonical_chat_id,
+        display_name=display_value,
+        phone_number=phone_value,
+        waha_contact_id=normalized_waha_contact_id,
+        lid=normalized_lid,
+        phone_jid=normalized_phone_jid,
+        source=source,
+        is_active=True,
+        last_seen_at=now,
+    )
+    db.add(contact)
+    db.flush()
+    return contact
+
+
+def _serialize_contact_ref(contact: WhatsAppContactSQLModel) -> Dict[str, Any]:
+    return {
+        "id": str(contact.id),
+        "chat_id": contact.chat_id,
+        "display_name": contact.display_name,
+        "phone_number": contact.phone_number,
+        "waha_contact_id": contact.waha_contact_id,
+        "lid": contact.lid,
+        "phone_jid": contact.phone_jid,
+        "source": contact.source,
+        "is_active": bool(contact.is_active),
+        "last_seen_at": contact.last_seen_at.isoformat() if contact.last_seen_at else None,
+    }
 
 
 def _resolve_whatsapp_client_id(payload: Dict[str, Any]) -> str:
@@ -1753,10 +1424,12 @@ def _should_ingest_conversation_message(payload: Dict[str, Any]) -> bool:
 
 def _cleanup_stale_flow_executions(db: Session, stale_before: datetime) -> int:
     """Mark crashed/stale running executions as failed so dashboard counters stay accurate."""
-    stale_executions = db.query(FlowExecution).filter(
-        FlowExecution.status == "running",
-        FlowExecution.started_at < stale_before,
-    ).all()
+    stale_executions = db.execute(
+        select(FlowExecutionSQLModel).where(
+            FlowExecutionSQLModel.status == "running",
+            FlowExecutionSQLModel.started_at < stale_before,
+        )
+    ).scalars().all()
 
     if not stale_executions:
         return 0
@@ -1848,21 +1521,29 @@ def _worker_runtime_status() -> Dict[str, Any]:
     db = SessionLocal()
     try:
         flow_stale_cleaned = _cleanup_stale_flow_executions(db, running_cutoff)
-        flow_recent_total = db.query(FlowExecution).filter(
-            FlowExecution.started_at >= window_start
-        ).count()
-        flow_recent_completed = db.query(FlowExecution).filter(
-            FlowExecution.started_at >= window_start,
-            FlowExecution.status == "completed",
-        ).count()
-        flow_recent_failed = db.query(FlowExecution).filter(
-            FlowExecution.started_at >= window_start,
-            FlowExecution.status == "failed",
-        ).count()
-        flow_running_now = db.query(FlowExecution).filter(
-            FlowExecution.status == "running",
-            FlowExecution.started_at >= running_cutoff,
-        ).count()
+        flow_recent_total = db.execute(
+            select(func.count()).select_from(FlowExecutionSQLModel).where(
+                FlowExecutionSQLModel.started_at >= window_start
+            )
+        ).scalar() or 0
+        flow_recent_completed = db.execute(
+            select(func.count()).select_from(FlowExecutionSQLModel).where(
+                FlowExecutionSQLModel.started_at >= window_start,
+                FlowExecutionSQLModel.status == "completed",
+            )
+        ).scalar() or 0
+        flow_recent_failed = db.execute(
+            select(func.count()).select_from(FlowExecutionSQLModel).where(
+                FlowExecutionSQLModel.started_at >= window_start,
+                FlowExecutionSQLModel.status == "failed",
+            )
+        ).scalar() or 0
+        flow_running_now = db.execute(
+            select(func.count()).select_from(FlowExecutionSQLModel).where(
+                FlowExecutionSQLModel.status == "running",
+                FlowExecutionSQLModel.started_at >= running_cutoff,
+            )
+        ).scalar() or 0
     except Exception as metric_error:
         flow_metrics_error = str(metric_error)
     finally:
@@ -1931,30 +1612,92 @@ class CollectionCreate(BaseModel):
     name: str
     description: Optional[str] = None
 
+
+class RetrievalProfileUpdate(BaseModel):
+    final_context_k: Optional[int] = Field(default=None, ge=2, le=32)
+    retrieval_candidates: Optional[int] = Field(default=None, ge=4, le=128)
+    grounding_threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    require_citations: Optional[bool] = None
+    min_context_chars: Optional[int] = Field(default=None, ge=40, le=20000)
+    query_variants_limit: Optional[int] = Field(default=None, ge=1, le=8)
+    clarification_enabled: Optional[bool] = None
+    clarification_threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    chunk_size: Optional[int] = Field(default=None, ge=200, le=8000)
+    chunk_overlap: Optional[int] = Field(default=None, ge=0, le=2000)
+
+
+def _serialize_retrieval_profile(profile: Optional[KnowledgeBaseRetrievalProfileSQLModel]) -> Dict[str, Any]:
+    if profile is None:
+        return {
+            "final_context_k": None,
+            "retrieval_candidates": None,
+            "grounding_threshold": None,
+            "require_citations": None,
+            "min_context_chars": None,
+            "query_variants_limit": None,
+            "clarification_enabled": None,
+            "clarification_threshold": None,
+            "chunk_size": None,
+            "chunk_overlap": None,
+            "updated_at": None,
+        }
+    return {
+        "final_context_k": profile.final_context_k,
+        "retrieval_candidates": profile.retrieval_candidates,
+        "grounding_threshold": profile.grounding_threshold,
+        "require_citations": profile.require_citations,
+        "min_context_chars": profile.min_context_chars,
+        "query_variants_limit": profile.query_variants_limit,
+        "clarification_enabled": profile.clarification_enabled,
+        "clarification_threshold": profile.clarification_threshold,
+        "chunk_size": profile.chunk_size,
+        "chunk_overlap": profile.chunk_overlap,
+        "updated_at": profile.updated_at.isoformat() if profile.updated_at else None,
+    }
+
 @app.get("/api/collections")
 def get_collections(db: Session = Depends(get_db_session)):
     """Saari knowledge collections ki list"""
-    collections = db.query(KnowledgeBase).all()
+    collections = db.execute(select(KnowledgeBaseSQLModel)).scalars().all()
+    profiles = db.execute(select(KnowledgeBaseRetrievalProfileSQLModel)).scalars().all()
+    profile_by_kb_id = {profile.knowledge_base_id: profile for profile in profiles}
     return {"collections": [
         {
             "id": str(c.id),
             "name": c.name,
             "description": c.description,
-            "created_at": c.created_at.isoformat()
+            "created_at": c.created_at.isoformat(),
+            "retrieval_profile": _serialize_retrieval_profile(profile_by_kb_id.get(c.id)),
         } for c in collections
     ]}
 
 @app.post("/api/collections")
 def create_new_collection(data: CollectionCreate, db: Session = Depends(get_db_session)):
     """Nayi collection banate hain (DB aur Qdrant dono mein)"""
-    existing = db.query(KnowledgeBase).filter(KnowledgeBase.name == data.name).first()
+    existing = db.execute(
+        select(KnowledgeBaseSQLModel).where(KnowledgeBaseSQLModel.name == data.name)
+    ).scalars().first()
     if existing:
         raise HTTPException(status_code=400, detail="Bhai, ye collection toh pehle se hai!")
     
-    kb = KnowledgeBase(name=data.name, description=data.description)
+    kb = KnowledgeBaseSQLModel(name=data.name, description=data.description)
     db.add(kb)
     db.commit()
     db.refresh(kb)
+
+    existing_profile = db.execute(
+        select(KnowledgeBaseRetrievalProfileSQLModel).where(
+            KnowledgeBaseRetrievalProfileSQLModel.knowledge_base_id == kb.id
+        )
+    ).scalars().first()
+    if not existing_profile:
+        db.add(
+            KnowledgeBaseRetrievalProfileSQLModel(
+                knowledge_base_id=kb.id,
+                clarification_enabled=True,
+            )
+        )
+        db.commit()
     
     try:
         create_qdrant_collection(data.name)
@@ -1969,14 +1712,21 @@ def sync_collections_with_qdrant(db: Session = Depends(get_db_session)):
     try:
         qdrant_names = list_qdrant_collections()
         qdrant_name_set = set(qdrant_names)
-        db_collections = db.query(KnowledgeBase).all()
+        db_collections = db.execute(select(KnowledgeBaseSQLModel)).scalars().all()
         db_names = {c.name for c in db_collections}
         
         added_count = 0
         for name in qdrant_names:
             if name not in db_names:
-                new_kb = KnowledgeBase(name=name, description="Imported from Qdrant")
+                new_kb = KnowledgeBaseSQLModel(name=name, description="Imported from Qdrant")
                 db.add(new_kb)
+                db.flush()
+                db.add(
+                    KnowledgeBaseRetrievalProfileSQLModel(
+                        knowledge_base_id=new_kb.id,
+                        clarification_enabled=True,
+                    )
+                )
                 added_count += 1
 
         removed_count = 0
@@ -1999,26 +1749,517 @@ def sync_collections_with_qdrant(db: Session = Depends(get_db_session)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Sync failed: {str(e)}")
 
+
+@app.get("/api/collections/{kb_name}/retrieval-profile")
+def get_collection_retrieval_profile(kb_name: str, db: Session = Depends(get_db_session)):
+    kb = db.execute(
+        select(KnowledgeBaseSQLModel).where(KnowledgeBaseSQLModel.name == kb_name)
+    ).scalars().first()
+    if not kb:
+        raise HTTPException(status_code=404, detail="Knowledge Base not found")
+
+    profile = db.execute(
+        select(KnowledgeBaseRetrievalProfileSQLModel).where(
+            KnowledgeBaseRetrievalProfileSQLModel.knowledge_base_id == kb.id
+        )
+    ).scalars().first()
+    return {
+        "status": "success",
+        "knowledge_base": {"id": str(kb.id), "name": kb.name},
+        "profile": _serialize_retrieval_profile(profile),
+        "defaults": {
+            "chunk_size": DEFAULT_CHUNK_SIZE,
+            "chunk_overlap": DEFAULT_CHUNK_OVERLAP,
+        },
+    }
+
+
+@app.put("/api/collections/{kb_name}/retrieval-profile")
+def upsert_collection_retrieval_profile(
+    kb_name: str,
+    payload: RetrievalProfileUpdate,
+    db: Session = Depends(get_db_session),
+):
+    kb = db.execute(
+        select(KnowledgeBaseSQLModel).where(KnowledgeBaseSQLModel.name == kb_name)
+    ).scalars().first()
+    if not kb:
+        raise HTTPException(status_code=404, detail="Knowledge Base not found")
+
+    profile = db.execute(
+        select(KnowledgeBaseRetrievalProfileSQLModel).where(
+            KnowledgeBaseRetrievalProfileSQLModel.knowledge_base_id == kb.id
+        )
+    ).scalars().first()
+    if not profile:
+        profile = KnowledgeBaseRetrievalProfileSQLModel(
+            knowledge_base_id=kb.id,
+            clarification_enabled=True,
+        )
+        db.add(profile)
+        db.flush()
+
+    updates = _model_dump(payload)
+    for key, value in updates.items():
+        setattr(profile, key, value)
+
+    if profile.chunk_size is not None and profile.chunk_overlap is not None and profile.chunk_overlap >= profile.chunk_size:
+        raise HTTPException(status_code=422, detail="chunk_overlap must be less than chunk_size")
+
+    db.commit()
+    db.refresh(profile)
+    return {
+        "status": "success",
+        "knowledge_base": {"id": str(kb.id), "name": kb.name},
+        "profile": _serialize_retrieval_profile(profile),
+    }
+
+
+def _resolve_index_chunk_settings(
+    *,
+    profile: Optional[KnowledgeBaseRetrievalProfileSQLModel],
+    chunk_size: Optional[int],
+    chunk_overlap: Optional[int],
+) -> tuple[int, int]:
+    resolved_chunk_size = int(chunk_size) if chunk_size is not None else int(
+        profile.chunk_size if profile and profile.chunk_size else DEFAULT_CHUNK_SIZE
+    )
+    resolved_chunk_overlap = int(chunk_overlap) if chunk_overlap is not None else int(
+        profile.chunk_overlap if profile and profile.chunk_overlap is not None else DEFAULT_CHUNK_OVERLAP
+    )
+    if resolved_chunk_overlap >= resolved_chunk_size:
+        resolved_chunk_overlap = max(0, resolved_chunk_size - 1)
+    return resolved_chunk_size, resolved_chunk_overlap
+
+
+def _collect_upload_sources(
+    *,
+    temp_dir: str,
+    files: Optional[List[UploadFile]],
+    urls: Optional[List[str]],
+) -> tuple[List[str], List[str]]:
+    file_paths: List[str] = []
+    normalized_urls: List[str] = []
+    seen_file_names: set[str] = set()
+
+    for file in files or []:
+        file_name = str(file.filename or "").strip()
+        if not file_name.lower().endswith(".pdf"):
+            continue
+        safe_name = os.path.basename(file_name) or f"upload-{len(file_paths)+1}.pdf"
+        if safe_name in seen_file_names:
+            stem, ext = os.path.splitext(safe_name)
+            safe_name = f"{stem}-{uuid.uuid4().hex[:6]}{ext or '.pdf'}"
+        seen_file_names.add(safe_name)
+        file_path = os.path.join(temp_dir, safe_name)
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        file_paths.append(file_path)
+
+    for raw in urls or []:
+        for candidate in str(raw or "").replace(",", "\n").splitlines():
+            clean = candidate.strip()
+            if clean and clean not in normalized_urls:
+                normalized_urls.append(clean)
+
+    return file_paths, normalized_urls
+
+
+def _source_progress_fraction(source: str, event: str, payload: Dict[str, Any]) -> float:
+    if event in {"embedding_upload_done", "no_chunks", "no_documents"}:
+        return 1.0
+    if event == "chunking_done":
+        return 0.64
+    if event == "chunking_start":
+        return 0.48
+    if event == "embedding_prepare_done":
+        return 0.46
+    if event == "embedding_prepare_start":
+        return 0.44
+    if event == "embedding_upload_start":
+        return 0.68
+    if event == "embedding_upload_batch_done":
+        total_batches = max(1, int(payload.get("total_batches") or 1))
+        batch_index = max(0, min(total_batches, int(payload.get("batch_index") or 0)))
+        return min(0.995, 0.68 + (batch_index / total_batches) * 0.31)
+
+    if source == "pdf":
+        if event == "pdf_loading_start":
+            return 0.04
+        if event in {"pdf_file_start", "pdf_file_done"}:
+            total = max(1, int(payload.get("total") or payload.get("total_files") or 1))
+            index = max(0, min(total, int(payload.get("index") or 0)))
+            ratio = index / total
+            return 0.08 + ratio * 0.30
+        if event == "pdf_loading_done":
+            return 0.40
+    if source == "url":
+        if event == "url_crawl_start":
+            return 0.04
+        if event == "url_fallback_start":
+            return 0.36
+        if event == "url_fallback_done":
+            return 0.39
+        if event in {"url_item_start", "url_item_done", "url_item_failed", "url_item_heartbeat"}:
+            total = max(1, int(payload.get("total") or payload.get("total_urls") or 1))
+            index = max(1, min(total, int(payload.get("index") or 1)))
+            base_units = float(index - 1)
+            if event == "url_item_done" or event == "url_item_failed":
+                unit_ratio = (base_units + 1.0) / total
+            elif event == "url_item_heartbeat":
+                timeout_seconds = max(1, int(payload.get("timeout_seconds") or 1))
+                elapsed_seconds = max(0, min(timeout_seconds, int(payload.get("elapsed_seconds") or 0)))
+                crawl_progress = min(0.98, elapsed_seconds / timeout_seconds)
+                unit_ratio = (base_units + crawl_progress) / total
+            else:
+                unit_ratio = base_units / total
+            ratio = max(0.0, min(1.0, unit_ratio))
+            return 0.08 + ratio * 0.30
+        if event == "url_crawl_done":
+            return 0.40
+    return 0.08
+
+
+def _source_progress_message(source: str, event: str, payload: Dict[str, Any]) -> str:
+    if source == "pdf":
+        if event == "pdf_loading_start":
+            return "Reading PDF files..."
+        if event in {"pdf_file_start", "pdf_file_done"}:
+            index = int(payload.get("index") or 0)
+            total = int(payload.get("total") or payload.get("total_files") or 0)
+            return f"Processing PDF {index}/{total}..."
+    if source == "url":
+        if event == "url_crawl_start":
+            return "Crawling website URLs..."
+        if event == "url_fallback_start":
+            return "Crawler slow. Switching to direct fetch fallback..."
+        if event == "url_fallback_done":
+            return "Fallback extraction complete. Chunking content..."
+        if event == "url_item_start":
+            index = int(payload.get("index") or 0)
+            total = int(payload.get("total") or payload.get("total_urls") or 0)
+            return f"Crawling URL {index}/{total}..."
+        if event == "url_item_heartbeat":
+            index = int(payload.get("index") or 0)
+            total = int(payload.get("total") or payload.get("total_urls") or 0)
+            elapsed = int(payload.get("elapsed_seconds") or 0)
+            timeout_seconds = int(payload.get("timeout_seconds") or 0)
+            if timeout_seconds > 0:
+                return f"Crawling URL {index}/{total}... {elapsed}s/{timeout_seconds}s"
+            return f"Crawling URL {index}/{total}..."
+        if event == "url_item_failed":
+            return "Some URLs could not be crawled. Continuing..."
+        if event == "url_crawl_done":
+            return "Website crawl complete. Chunking content..."
+
+    if event == "chunking_start":
+        return "Chunking extracted content..."
+    if event == "chunking_done":
+        prepared_chunk_count = int(payload.get("prepared_chunk_count") or 0)
+        return f"Prepared {prepared_chunk_count} chunks..."
+    if event == "embedding_prepare_start":
+        return "Preparing embedding pipeline..."
+    if event == "embedding_upload_start":
+        total_chunks = int(payload.get("total_chunks") or 0)
+        return f"Embedding and uploading {total_chunks} chunks..."
+    if event == "embedding_upload_batch_done":
+        batch_index = int(payload.get("batch_index") or 0)
+        total_batches = int(payload.get("total_batches") or 0)
+        return f"Uploading embeddings batch {batch_index}/{total_batches}..."
+    if event == "embedding_upload_done":
+        return "Embedding upload complete."
+    return "Indexing in progress..."
+
+
+def _run_upload_index_job(
+    *,
+    job_id: str,
+    kb_name: str,
+    file_paths: List[str],
+    urls: List[str],
+    force_recreate: bool,
+    url_max_pages: Optional[int],
+    url_use_sitemap: bool,
+    pdf_use_ocr: bool,
+    chunk_size: int,
+    chunk_overlap: int,
+    temp_dir: str,
+) -> None:
+    try:
+        _set_index_job(
+            job_id,
+            status="running",
+            phase="bootstrap",
+            phase_label="Starting indexing pipeline",
+            message="Starting indexing pipeline...",
+            progress_percent=2.0,
+        )
+
+        source_plan: List[str] = []
+        if file_paths:
+            source_plan.append("pdf")
+        if urls:
+            source_plan.append("url")
+        source_count = max(1, len(source_plan))
+        source_progress_span = 88.0
+        source_progress_start = 5.0
+
+        def update_from_event(source: str, source_index: int, event: str, payload: Dict[str, Any]) -> None:
+            segment_start = source_progress_start + (source_progress_span / source_count) * source_index
+            segment_end = source_progress_start + (source_progress_span / source_count) * (source_index + 1)
+            fraction = max(0.0, min(1.0, _source_progress_fraction(source, event, payload)))
+            percent = segment_start + (segment_end - segment_start) * fraction
+            _set_index_job(
+                job_id,
+                status="running",
+                phase=f"{source}.{event}",
+                phase_label=_source_progress_message(source, event, payload),
+                message=_source_progress_message(source, event, payload),
+                progress_percent=percent,
+            )
+
+        pdf_chunk_count = 0
+        url_chunk_count = 0
+        force_consumed = False
+        source_idx = 0
+
+        if file_paths:
+            _set_index_job(
+                job_id,
+                status="running",
+                phase="pdf.start",
+                phase_label="Indexing PDF sources",
+                message="Indexing PDF sources...",
+                progress_percent=source_progress_start + 1.0,
+            )
+            pdf_chunk_count = index_pdfs_to_collection(
+                kb_name,
+                file_paths,
+                force_recreate=force_recreate,
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+                use_ocr=pdf_use_ocr,
+                progress_callback=lambda event, payload, idx=source_idx: update_from_event("pdf", idx, event, payload),
+            )
+            force_consumed = force_recreate
+            source_idx += 1
+
+        if urls:
+            _set_index_job(
+                job_id,
+                status="running",
+                phase="url.start",
+                phase_label="Indexing website sources",
+                message="Indexing website sources...",
+                progress_percent=source_progress_start + (source_progress_span / source_count) * source_idx + 1.0,
+            )
+            url_chunk_count = index_urls_to_collection(
+                kb_name,
+                urls,
+                force_recreate=(force_recreate and not force_consumed),
+                max_pages_per_site=url_max_pages,
+                use_sitemap=url_use_sitemap,
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+                progress_callback=lambda event, payload, idx=source_idx: update_from_event("url", idx, event, payload),
+            )
+
+        chunk_count = int(pdf_chunk_count) + int(url_chunk_count)
+        if chunk_count == 0:
+            raise ValueError(
+                "No readable content was extracted from the provided sources. "
+                "Try different URLs (or www variant), ensure pages are public HTML, "
+                "and verify PDFs contain selectable text."
+            )
+
+        _set_index_job(
+            job_id,
+            status="running",
+            phase="finalize",
+            phase_label="Finalizing index",
+            message="Finalizing index...",
+            progress_percent=97.0,
+        )
+
+        points_count = get_collection_point_count(kb_name)
+        result_payload = {
+            "status": "success",
+            "message": (
+                f"Indexed {len(file_paths)} PDF file(s) and {len(urls)} URL(s) "
+                f"with {chunk_count} chunks into '{kb_name}'"
+            ),
+            "file_count": len(file_paths),
+            "url_count": len(urls),
+            "chunk_count": chunk_count,
+            "pdf_chunk_count": int(pdf_chunk_count),
+            "url_chunk_count": int(url_chunk_count),
+            "chunk_size_used": int(chunk_size),
+            "chunk_overlap_used": int(chunk_overlap),
+            "ocr_used": bool(pdf_use_ocr),
+            "points_count": int(points_count),
+        }
+        _set_index_job(
+            job_id,
+            status="completed",
+            phase="completed",
+            phase_label="Indexing complete",
+            message=result_payload["message"],
+            progress_percent=100.0,
+            result=result_payload,
+            error=None,
+        )
+    except Exception as error:
+        detail = str(error) or "Indexing failed."
+        _set_index_job(
+            job_id,
+            status="failed",
+            phase="failed",
+            phase_label="Indexing failed",
+            message=detail,
+            progress_percent=100.0,
+            error=detail,
+        )
+    finally:
+        try:
+            shutil.rmtree(temp_dir)
+        except Exception:
+            logger.warning("Failed to clean temp indexing directory: %s", temp_dir)
+
+
+@app.post("/api/collections/{kb_name}/upload/start")
+async def start_upload_documents_job(
+    kb_name: str,
+    force_recreate: bool = Query(default=False),
+    url_max_pages: Optional[int] = Query(default=None, ge=1, le=2000),
+    url_use_sitemap: bool = Query(default=True),
+    pdf_use_ocr: bool = Query(default=False),
+    chunk_size: Optional[int] = Query(default=None, ge=200, le=8000),
+    chunk_overlap: Optional[int] = Query(default=None, ge=0, le=2000),
+    files: Optional[List[UploadFile]] = File(default=None),
+    urls: Optional[List[str]] = Form(default=None),
+    db: Session = Depends(get_db_session),
+):
+    kb = db.execute(
+        select(KnowledgeBaseSQLModel).where(KnowledgeBaseSQLModel.name == kb_name)
+    ).scalars().first()
+    if not kb:
+        raise HTTPException(status_code=404, detail="Knowledge Base not found")
+
+    profile = db.execute(
+        select(KnowledgeBaseRetrievalProfileSQLModel).where(
+            KnowledgeBaseRetrievalProfileSQLModel.knowledge_base_id == kb.id
+        )
+    ).scalars().first()
+
+    resolved_chunk_size, resolved_chunk_overlap = _resolve_index_chunk_settings(
+        profile=profile,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+    )
+
+    temp_dir = tempfile.mkdtemp(prefix="index-job-")
+    try:
+        file_paths, normalized_urls = _collect_upload_sources(temp_dir=temp_dir, files=files, urls=urls)
+        if not file_paths and not normalized_urls:
+            shutil.rmtree(temp_dir)
+            raise HTTPException(status_code=400, detail="Provide at least one PDF file or one website URL")
+    except Exception:
+        if os.path.isdir(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
+
+    job_id = f"index_{uuid.uuid4().hex}"
+    created_at = _utc_iso_now()
+    _set_index_job(
+        job_id,
+        status="queued",
+        kb_name=kb_name,
+        created_at=created_at,
+        phase="queued",
+        phase_label="Job queued",
+        message="Indexing job queued.",
+        progress_percent=0.0,
+        force_recreate=bool(force_recreate),
+        file_count=len(file_paths),
+        url_count=len(normalized_urls),
+        chunk_size_used=resolved_chunk_size,
+        chunk_overlap_used=resolved_chunk_overlap,
+        ocr_used=bool(pdf_use_ocr),
+        url_max_pages=url_max_pages,
+        url_use_sitemap=bool(url_use_sitemap),
+        temp_dir=temp_dir,
+        file_paths=file_paths,
+        urls=normalized_urls,
+    )
+
+    thread = threading.Thread(
+        target=_run_upload_index_job,
+        kwargs={
+            "job_id": job_id,
+            "kb_name": kb_name,
+            "file_paths": file_paths,
+            "urls": normalized_urls,
+            "force_recreate": bool(force_recreate),
+            "url_max_pages": url_max_pages,
+            "url_use_sitemap": bool(url_use_sitemap),
+            "pdf_use_ocr": bool(pdf_use_ocr),
+            "chunk_size": int(resolved_chunk_size),
+            "chunk_overlap": int(resolved_chunk_overlap),
+            "temp_dir": temp_dir,
+        },
+        daemon=True,
+    )
+    thread.start()
+
+    payload = _get_index_job(job_id) or {}
+    return _public_index_job_payload(payload)
+
+
+@app.get("/api/collections/upload/jobs/{job_id}")
+def get_upload_documents_job(job_id: str):
+    payload = _get_index_job(job_id)
+    if not payload:
+        raise HTTPException(status_code=404, detail="Indexing job not found")
+    return _public_index_job_payload(payload)
+
 @app.post("/api/collections/{kb_name}/upload")
 async def upload_documents(
     kb_name: str,
     force_recreate: bool = Query(default=False),
     url_max_pages: Optional[int] = Query(default=None, ge=1, le=2000),
     url_use_sitemap: bool = Query(default=True),
-    chunk_size: int = Query(default=1000, ge=200, le=8000),
-    chunk_overlap: int = Query(default=200, ge=0, le=2000),
+    pdf_use_ocr: bool = Query(default=False),
+    chunk_size: Optional[int] = Query(default=None, ge=200, le=8000),
+    chunk_overlap: Optional[int] = Query(default=None, ge=0, le=2000),
     files: Optional[List[UploadFile]] = File(default=None),
     urls: Optional[List[str]] = Form(default=None),
     db: Session = Depends(get_db_session),
 ):
     """Upload and index PDFs and/or website URLs into a collection."""
-    kb = db.query(KnowledgeBase).filter(KnowledgeBase.name == kb_name).first()
+    kb = db.execute(
+        select(KnowledgeBaseSQLModel).where(KnowledgeBaseSQLModel.name == kb_name)
+    ).scalars().first()
     if not kb:
         raise HTTPException(status_code=404, detail="Knowledge Base not found")
     
     temp_dir = tempfile.mkdtemp()
     file_paths = []
     normalized_urls: List[str] = []
+
+    profile = db.execute(
+        select(KnowledgeBaseRetrievalProfileSQLModel).where(
+            KnowledgeBaseRetrievalProfileSQLModel.knowledge_base_id == kb.id
+        )
+    ).scalars().first()
+
+    resolved_chunk_size = int(chunk_size) if chunk_size is not None else int(
+        profile.chunk_size if profile and profile.chunk_size else DEFAULT_CHUNK_SIZE
+    )
+    resolved_chunk_overlap = int(chunk_overlap) if chunk_overlap is not None else int(
+        profile.chunk_overlap if profile and profile.chunk_overlap is not None else DEFAULT_CHUNK_OVERLAP
+    )
+    if resolved_chunk_overlap >= resolved_chunk_size:
+        resolved_chunk_overlap = max(0, resolved_chunk_size - 1)
     
     try:
         for file in files or []:
@@ -2050,8 +2291,9 @@ async def upload_documents(
                 kb_name,
                 file_paths,
                 force_recreate,
-                chunk_size,
-                chunk_overlap,
+                resolved_chunk_size,
+                resolved_chunk_overlap,
+                pdf_use_ocr,
             )
             force_consumed = force_recreate
 
@@ -2063,8 +2305,8 @@ async def upload_documents(
                 (force_recreate and not force_consumed),
                 url_max_pages,
                 url_use_sitemap,
-                chunk_size,
-                chunk_overlap,
+                resolved_chunk_size,
+                resolved_chunk_overlap,
             )
 
         chunk_count = pdf_chunk_count + url_chunk_count
@@ -2089,6 +2331,9 @@ async def upload_documents(
             "chunk_count": chunk_count,
             "pdf_chunk_count": pdf_chunk_count,
             "url_chunk_count": url_chunk_count,
+            "chunk_size_used": resolved_chunk_size,
+            "chunk_overlap_used": resolved_chunk_overlap,
+            "ocr_used": bool(pdf_use_ocr),
             "points_count": get_collection_point_count(kb_name),
         }
     except ValueError as e:
@@ -2113,7 +2358,10 @@ class WorkspaceCreate(BaseModel):
     knowledge_base_id: Optional[str] = None
     system_prompt: Optional[str] = None
     user_prompt_template: Optional[str] = None
-    group_ids: List[str] = [] 
+    low_quality_clarification_text: Optional[str] = None
+    group_ids: List[str] = []
+    contact_filter_mode: str = "all"
+    contact_chat_ids: List[str] = []
 
 
 class WorkspaceStatusUpdate(BaseModel):
@@ -2122,39 +2370,69 @@ class WorkspaceStatusUpdate(BaseModel):
 @app.get("/api/workspaces")
 def get_workspaces(db: Session = Depends(get_db_session)):
     """Saare workspaces ki list nikaalte hain"""
-    workspaces = db.query(Workspace).all()
+    ensure_workspace_flow_schema(db)
+    normalized = _normalize_contact_primary_chat_ids(db)
+    if any(int(normalized.get(key, 0)) > 0 for key in ("deduped", "promoted", "merged_conflicts")):
+        db.commit()
+    workspaces = db.execute(select(WorkspaceSQLModel)).scalars().all()
+    knowledge_base_ids = [ws.knowledge_base_id for ws in workspaces if ws.knowledge_base_id]
+    kb_by_id = {}
+    if knowledge_base_ids:
+        kb_rows = db.execute(
+            select(KnowledgeBaseSQLModel).where(KnowledgeBaseSQLModel.id.in_(knowledge_base_ids))
+        ).scalars().all()
+        kb_by_id = {kb.id: kb for kb in kb_rows}
+
     result = []
     for ws in workspaces:
-        # Get assigned groups
-        groups = db.query(WhatsAppGroup).join(WorkspaceGroup).filter(WorkspaceGroup.workspace_id == ws.id).all()
+        kb = kb_by_id.get(ws.knowledge_base_id) if ws.knowledge_base_id else None
+        # Get assigned groups.
+        groups = db.execute(
+            select(WhatsAppGroupSQLModel)
+            .join(WorkspaceGroupSQLModel, WorkspaceGroupSQLModel.group_id == WhatsAppGroupSQLModel.id)
+            .where(WorkspaceGroupSQLModel.workspace_id == ws.id)
+        ).scalars().all()
+        contacts = db.execute(
+            select(WhatsAppContactSQLModel)
+            .join(WorkspaceContactSQLModel, WorkspaceContactSQLModel.contact_id == WhatsAppContactSQLModel.id)
+            .where(WorkspaceContactSQLModel.workspace_id == ws.id)
+        ).scalars().all()
         result.append({
             "id": str(ws.id),
             "name": ws.name,
             "is_active": ws.is_active,
+            "contact_filter_mode": str(getattr(ws, "contact_filter_mode", "all") or "all"),
             "knowledge_base": {
-                "id": str(ws.knowledge_base.id),
-                "name": ws.knowledge_base.name
-            } if ws.knowledge_base else None,
-            "groups": [{"id": str(g.id), "name": g.name, "chat_id": g.chat_id} for g in groups]
+                "id": str(kb.id),
+                "name": kb.name
+            } if kb else None,
+            "groups": [{"id": str(g.id), "name": g.name, "chat_id": g.chat_id} for g in groups],
+            "contacts": [_serialize_contact_ref(contact) for contact in contacts],
         })
     return {"workspaces": result}
 
 @app.post("/api/workspaces")
 def create_workspace(data: WorkspaceCreate, db: Session = Depends(get_db_session)):
     """Create a new workspace and assign groups"""
-    ws = Workspace(
+    ensure_workspace_flow_schema(db)
+    contact_filter_mode = _resolve_contact_filter_mode(data.contact_filter_mode)
+    ws = WorkspaceSQLModel(
         name=data.name,
-        knowledge_base_id=data.knowledge_base_id,
+        knowledge_base_id=uuid.UUID(data.knowledge_base_id) if data.knowledge_base_id else None,
         system_prompt=data.system_prompt,
         user_prompt_template=data.user_prompt_template,
+        low_quality_clarification_text=data.low_quality_clarification_text,
+        contact_filter_mode=contact_filter_mode,
         is_active=True
     )
     db.add(ws)
-    db.flush() # Get ID
+    db.flush()  # Get ID.
     
-    # Assign groups
+    # Assign groups.
     for group_id in data.group_ids:
-        db.add(WorkspaceGroup(workspace_id=ws.id, group_id=group_id))
+        db.add(WorkspaceGroupSQLModel(workspace_id=ws.id, group_id=uuid.UUID(group_id)))
+    # Assign contact filters.
+    _assign_workspace_contacts(db, ws.id, data.contact_chat_ids)
     
     db.commit()
     db.refresh(ws)
@@ -2163,8 +2441,14 @@ def create_workspace(data: WorkspaceCreate, db: Session = Depends(get_db_session
 @app.get("/api/workspaces/{workspace_id}")
 def get_workspace(workspace_id: uuid.UUID, db: Session = Depends(get_db_session)):
     """Get a specific workspace with full details"""
+    ensure_workspace_flow_schema(db)
+    normalized = _normalize_contact_primary_chat_ids(db)
+    if any(int(normalized.get(key, 0)) > 0 for key in ("deduped", "promoted", "merged_conflicts")):
+        db.commit()
     print(f"DEBUG: >>> Hit GET /api/workspaces/[{workspace_id}] <<<")
-    ws = db.query(Workspace).filter(Workspace.id == workspace_id).first()
+    ws = db.execute(
+        select(WorkspaceSQLModel).where(WorkspaceSQLModel.id == workspace_id)
+    ).scalars().first()
     
     if not ws:
         print(f"DEBUG: >>> Workspace [{workspace_id}] NOT found in DB <<<")
@@ -2172,7 +2456,16 @@ def get_workspace(workspace_id: uuid.UUID, db: Session = Depends(get_db_session)
         
     print(f"DEBUG: Found workspace {ws.name}")
     # Get assigned groups
-    groups = db.query(WhatsAppGroup).join(WorkspaceGroup).filter(WorkspaceGroup.workspace_id == ws.id).all()
+    groups = db.execute(
+        select(WhatsAppGroupSQLModel)
+        .join(WorkspaceGroupSQLModel, WorkspaceGroupSQLModel.group_id == WhatsAppGroupSQLModel.id)
+        .where(WorkspaceGroupSQLModel.workspace_id == ws.id)
+    ).scalars().all()
+    contacts = db.execute(
+        select(WhatsAppContactSQLModel)
+        .join(WorkspaceContactSQLModel, WorkspaceContactSQLModel.contact_id == WhatsAppContactSQLModel.id)
+        .where(WorkspaceContactSQLModel.workspace_id == ws.id)
+    ).scalars().all()
     
     return {
         "id": str(ws.id),
@@ -2180,15 +2473,21 @@ def get_workspace(workspace_id: uuid.UUID, db: Session = Depends(get_db_session)
         "knowledge_base_id": str(ws.knowledge_base_id) if ws.knowledge_base_id else None,
         "system_prompt": ws.system_prompt,
         "user_prompt_template": ws.user_prompt_template,
+        "low_quality_clarification_text": ws.low_quality_clarification_text,
+        "contact_filter_mode": str(getattr(ws, "contact_filter_mode", "all") or "all"),
         "is_active": ws.is_active,
-        "groups": [{"id": str(g.id), "name": g.name, "chat_id": g.chat_id} for g in groups]
+        "groups": [{"id": str(g.id), "name": g.name, "chat_id": g.chat_id} for g in groups],
+        "contacts": [_serialize_contact_ref(contact) for contact in contacts],
     }
 
 @app.put("/api/workspaces/{workspace_id}")
 def update_workspace(workspace_id: uuid.UUID, data: WorkspaceCreate, db: Session = Depends(get_db_session)):
     """Update an existing workspace"""
     print(f"DEBUG: Hit PUT /api/workspaces/{workspace_id}")
-    ws = db.query(Workspace).filter(Workspace.id == workspace_id).first()
+    ensure_workspace_flow_schema(db)
+    ws = db.execute(
+        select(WorkspaceSQLModel).where(WorkspaceSQLModel.id == workspace_id)
+    ).scalars().first()
     if not ws:
         raise HTTPException(status_code=404, detail="Workspace not found")
         
@@ -2196,11 +2495,19 @@ def update_workspace(workspace_id: uuid.UUID, data: WorkspaceCreate, db: Session
     ws.knowledge_base_id = uuid.UUID(data.knowledge_base_id) if data.knowledge_base_id else None
     ws.system_prompt = data.system_prompt
     ws.user_prompt_template = data.user_prompt_template
+    ws.low_quality_clarification_text = data.low_quality_clarification_text
+    ws.contact_filter_mode = _resolve_contact_filter_mode(data.contact_filter_mode)
     
     # Update groups: Clear and re-assign
-    db.query(WorkspaceGroup).filter(WorkspaceGroup.workspace_id == ws.id).delete()
+    db.execute(
+        delete(WorkspaceGroupSQLModel).where(WorkspaceGroupSQLModel.workspace_id == ws.id)
+    )
     for group_id in data.group_ids:
-        db.add(WorkspaceGroup(workspace_id=ws.id, group_id=uuid.UUID(group_id)))
+        db.add(WorkspaceGroupSQLModel(workspace_id=ws.id, group_id=uuid.UUID(group_id)))
+    db.execute(
+        delete(WorkspaceContactSQLModel).where(WorkspaceContactSQLModel.workspace_id == ws.id)
+    )
+    _assign_workspace_contacts(db, ws.id, data.contact_chat_ids)
         
     db.commit()
     print(f"DEBUG: Updated workspace {ws.name}")
@@ -2211,23 +2518,32 @@ def delete_workspace(workspace_id: uuid.UUID, db: Session = Depends(get_db_sessi
     """Delete a workspace and its group assignments"""
     print(f"DEBUG: Hit DELETE /api/workspaces/{workspace_id}")
     ensure_workspace_flow_schema(db)
-    ws = db.query(Workspace).filter(Workspace.id == workspace_id).first()
+    ws = db.execute(
+        select(WorkspaceSQLModel).where(WorkspaceSQLModel.id == workspace_id)
+    ).scalars().first()
     if not ws:
         raise HTTPException(status_code=404, detail="Workspace not found")
         
     # Delete group assignments
-    db.query(WorkspaceGroup).filter(WorkspaceGroup.workspace_id == ws.id).delete()
+    db.execute(
+        delete(WorkspaceGroupSQLModel).where(WorkspaceGroupSQLModel.workspace_id == ws.id)
+    )
+    db.execute(
+        delete(WorkspaceContactSQLModel).where(WorkspaceContactSQLModel.workspace_id == ws.id)
+    )
     
     # Keep logic layers, just unassign from this workspace
-    db.query(Flow).filter(Flow.workspace_id == ws.id).update(
-        {
-            Flow.workspace_id: None,
-            Flow.updated_at: datetime.now(),
-        },
-        synchronize_session=False,
-    )
+    legacy_flows = db.execute(
+        select(FlowSQLModel).where(FlowSQLModel.workspace_id == ws.id)
+    ).scalars().all()
+    for legacy_flow in legacy_flows:
+        legacy_flow.workspace_id = None
+        legacy_flow.updated_at = datetime.now()
+        db.add(legacy_flow)
 
-    db.query(WorkspaceFlow).filter(WorkspaceFlow.workspace_id == ws.id).delete(synchronize_session=False)
+    db.execute(
+        delete(WorkspaceFlowSQLModel).where(WorkspaceFlowSQLModel.workspace_id == ws.id)
+    )
     
     db.delete(ws)
     db.commit()
@@ -2242,15 +2558,19 @@ def delete_workspace(workspace_id: uuid.UUID, db: Session = Depends(get_db_sessi
 @app.get("/api/groups")
 def get_groups(db: Session = Depends(get_db_session)):
     """Database se saare WhatsApp groups nikaalo"""
-    groups = db.query(WhatsAppGroup).all()
+    groups = db.execute(select(WhatsAppGroupSQLModel)).scalars().all()
     
     result = []
     for group in groups:
         # Get assigned flows
-        flow_groups = db.query(FlowGroup).filter(FlowGroup.group_id == group.id).all()
+        flow_groups = db.execute(
+            select(FlowGroupSQLModel).where(FlowGroupSQLModel.group_id == group.id)
+        ).scalars().all()
         assigned_flows = []
         for fg in flow_groups:
-            flow = db.query(Flow).filter(Flow.id == fg.flow_id).first()
+            flow = db.execute(
+                select(FlowSQLModel).where(FlowSQLModel.id == fg.flow_id)
+            ).scalars().first()
             if flow:
                 assigned_flows.append({
                     "id": str(flow.id),
@@ -2273,20 +2593,388 @@ def get_groups(db: Session = Depends(get_db_session)):
     return {"groups": result, "total": len(result)}
 
 
+def _sync_contacts_from_conversation_keys(db: Session) -> int:
+    """
+    Backfill contacts from existing Redis conversation keys.
+    Keys look like: conversation:<chat_id>
+    """
+    synced = 0
+    try:
+        raw_keys = queue.connection.keys("conversation:*")
+    except Exception:
+        return 0
+
+    for raw_key in raw_keys or []:
+        key = raw_key.decode("utf-8") if isinstance(raw_key, bytes) else str(raw_key)
+        if key.startswith("conversation:ingress:"):
+            continue
+        chat_id = key.split("conversation:", 1)[-1].strip()
+        if "::ws:" in chat_id:
+            continue
+        normalized = _normalize_contact_chat_id(chat_id)
+        if not normalized or "@g.us" in normalized:
+            continue
+        contact = _upsert_contact_by_chat_id(db, normalized, source="conversation")
+        if contact:
+            synced += 1
+    return synced
+
+
+def _sync_contacts_from_waha(db: Session) -> Dict[str, int]:
+    """
+    Sync contacts directly from WAHA `/api/contacts/all?session=...`.
+    Preference for contact id mapping:
+    1) phoneNumber (@s.whatsapp.net)
+    2) lid (@lid)
+    3) id (@c.us)
+    """
+    fetched = 0
+    synced = 0
+
+    try:
+        raw_contacts = waha_client.get_all_contacts(sort_by="name", sort_order="desc")
+    except Exception as exc:
+        logger.warning("WAHA contacts sync failed: %s", exc)
+        return {"fetched": 0, "synced": 0}
+
+    if not isinstance(raw_contacts, list):
+        return {"fetched": 0, "synced": 0}
+
+    fetched = len(raw_contacts)
+    for item in raw_contacts:
+        if not isinstance(item, dict):
+            continue
+
+        display_name = str(item.get("name") or item.get("pushname") or "").strip() or None
+        normalized_id = _normalize_contact_chat_id(item.get("id")) or None
+        normalized_lid = _normalize_contact_chat_id(item.get("lid")) or None
+        normalized_phone_jid = _normalize_contact_chat_id(item.get("phoneNumber")) or None
+        normalized_chat_id = normalized_lid or normalized_phone_jid or normalized_id
+
+        if not normalized_chat_id:
+            continue
+
+        contact = _upsert_contact_by_chat_id(
+            db,
+            normalized_chat_id,
+            display_name=display_name,
+            source="waha",
+            waha_contact_id=normalized_id,
+            lid=normalized_lid,
+            phone_jid=normalized_phone_jid,
+        )
+        if contact:
+            synced += 1
+
+    return {"fetched": int(fetched), "synced": int(synced)}
+
+
+def _assign_workspace_contacts(
+    db: Session,
+    workspace_id: uuid.UUID,
+    chat_ids: List[str],
+) -> None:
+    """
+    Attach workspace contact filters while preventing identity duplicates.
+    Multiple ids like @lid and @s.whatsapp.net for the same person map to one contact row.
+    """
+    attached_contact_ids: set[str] = set()
+    for chat_id in chat_ids or []:
+        contact = _upsert_contact_by_chat_id(db, chat_id, source="manual")
+        if not contact:
+            continue
+        contact_key = str(contact.id)
+        if contact_key in attached_contact_ids:
+            continue
+        attached_contact_ids.add(contact_key)
+        db.add(WorkspaceContactSQLModel(workspace_id=workspace_id, contact_id=contact.id))
+
+
+def _contact_identity_tokens(contact: WhatsAppContactSQLModel) -> List[str]:
+    tokens: List[str] = []
+    for raw_value in (
+        contact.chat_id,
+        contact.waha_contact_id,
+        contact.lid,
+        contact.phone_jid,
+    ):
+        normalized = _normalize_contact_chat_id(raw_value)
+        if normalized and "@g.us" not in normalized:
+            token = f"jid:{normalized}"
+            if token not in tokens:
+                tokens.append(token)
+    phone_digits = _extract_phone_number(contact.phone_number or contact.phone_jid or contact.chat_id)
+    if len(phone_digits) >= 8:
+        token = f"phone:{phone_digits}"
+        if token not in tokens:
+            tokens.append(token)
+    return tokens
+
+
+def _contact_quality_score(contact: WhatsAppContactSQLModel) -> tuple:
+    display_name = str(contact.display_name or "").strip()
+    has_meaningful_name = bool(display_name and not display_name.isdigit())
+    return (
+        int(has_meaningful_name),
+        int(bool(contact.waha_contact_id)),
+        int(bool(contact.lid)),
+        int(bool(contact.phone_jid)),
+        int(bool(contact.phone_number)),
+        int(bool(contact.last_seen_at)),
+        contact.last_seen_at or datetime.min,
+        contact.updated_at or datetime.min,
+        contact.created_at or datetime.min,
+    )
+
+
+def _merge_contact_fields(target: WhatsAppContactSQLModel, source: WhatsAppContactSQLModel) -> None:
+    target_name = str(target.display_name or "").strip()
+    source_name = str(source.display_name or "").strip()
+    if source_name and ((not target_name) or target_name.isdigit()):
+        target.display_name = source_name
+
+    target.phone_number = target.phone_number or source.phone_number
+    target.waha_contact_id = target.waha_contact_id or source.waha_contact_id
+    target.lid = target.lid or source.lid
+    target.phone_jid = target.phone_jid or source.phone_jid
+
+    if (target.source or "").strip().lower() != "waha" and (source.source or "").strip().lower() == "waha":
+        target.source = "waha"
+
+    if source.last_seen_at and (not target.last_seen_at or source.last_seen_at > target.last_seen_at):
+        target.last_seen_at = source.last_seen_at
+
+    target.is_active = bool(target.is_active) or bool(source.is_active)
+
+
+def _normalize_contact_primary_chat_ids(db: Session) -> Dict[str, int]:
+    """
+    Ensure primary contact chat_id is canonical for WhatsApp identities.
+    Preference: lid > phone_jid > waha_contact_id > existing chat_id.
+    Also merges any chat_id conflicts safely before promotion.
+    """
+    merged = _dedupe_whatsapp_contacts(db)
+    promoted = 0
+    merged_conflicts = 0
+
+    contacts = db.execute(
+        select(WhatsAppContactSQLModel).where(~WhatsAppContactSQLModel.chat_id.like("%@g.us"))
+    ).scalars().all()
+
+    for contact in contacts:
+        preferred_chat_id = (
+            _normalize_contact_chat_id(contact.lid)
+            or _normalize_contact_chat_id(contact.phone_jid)
+            or _normalize_contact_chat_id(contact.waha_contact_id)
+            or _normalize_contact_chat_id(contact.chat_id)
+        )
+        if not preferred_chat_id or preferred_chat_id == contact.chat_id:
+            continue
+
+        conflict = db.execute(
+            select(WhatsAppContactSQLModel).where(
+                WhatsAppContactSQLModel.chat_id == preferred_chat_id,
+                WhatsAppContactSQLModel.id != contact.id,
+            )
+        ).scalars().first()
+
+        if conflict:
+            # Merge lower-quality row into higher-quality one, then keep canonical chat_id row.
+            canonical = max([contact, conflict], key=_contact_quality_score)
+            duplicate = conflict if canonical.id == contact.id else contact
+
+            _merge_contact_fields(canonical, duplicate)
+
+            duplicate_links = db.execute(
+                select(WorkspaceContactSQLModel).where(WorkspaceContactSQLModel.contact_id == duplicate.id)
+            ).scalars().all()
+            for link in duplicate_links:
+                existing_link = db.execute(
+                    select(WorkspaceContactSQLModel).where(
+                        WorkspaceContactSQLModel.workspace_id == link.workspace_id,
+                        WorkspaceContactSQLModel.contact_id == canonical.id,
+                    )
+                ).scalars().first()
+                if existing_link:
+                    db.delete(link)
+                else:
+                    link.contact_id = canonical.id
+                    db.add(link)
+
+            db.delete(duplicate)
+            db.add(canonical)
+            merged_conflicts += 1
+            continue
+
+        contact.chat_id = preferred_chat_id
+        db.add(contact)
+        promoted += 1
+
+    return {
+        "deduped": int(merged),
+        "promoted": int(promoted),
+        "merged_conflicts": int(merged_conflicts),
+    }
+
+
+def _dedupe_whatsapp_contacts(db: Session) -> int:
+    """
+    Merge duplicate contacts representing the same person across
+    @lid / @s.whatsapp.net / @c.us identities.
+    """
+    contacts = db.execute(
+        select(WhatsAppContactSQLModel).where(~WhatsAppContactSQLModel.chat_id.like("%@g.us"))
+    ).scalars().all()
+    if len(contacts) < 2:
+        return 0
+
+    by_id: Dict[str, WhatsAppContactSQLModel] = {str(contact.id): contact for contact in contacts}
+    id_to_tokens: Dict[str, List[str]] = {}
+    token_to_ids: Dict[str, set] = defaultdict(set)
+
+    for contact in contacts:
+        cid = str(contact.id)
+        tokens = _contact_identity_tokens(contact)
+        id_to_tokens[cid] = tokens
+        for token in tokens:
+            token_to_ids[token].add(cid)
+
+    merged_count = 0
+    visited: set = set()
+
+    for cid in list(by_id.keys()):
+        if cid in visited:
+            continue
+        stack = [cid]
+        component_ids: set = set()
+
+        while stack:
+            current_id = stack.pop()
+            if current_id in visited:
+                continue
+            visited.add(current_id)
+            component_ids.add(current_id)
+            for token in id_to_tokens.get(current_id, []):
+                for neighbor_id in token_to_ids.get(token, set()):
+                    if neighbor_id not in visited:
+                        stack.append(neighbor_id)
+
+        if len(component_ids) <= 1:
+            continue
+
+        component_contacts = [by_id[item_id] for item_id in component_ids if item_id in by_id]
+        if len(component_contacts) <= 1:
+            continue
+        canonical = max(component_contacts, key=_contact_quality_score)
+
+        for duplicate in component_contacts:
+            if duplicate.id == canonical.id:
+                continue
+
+            _merge_contact_fields(canonical, duplicate)
+
+            duplicate_links = db.execute(
+                select(WorkspaceContactSQLModel).where(WorkspaceContactSQLModel.contact_id == duplicate.id)
+            ).scalars().all()
+            for link in duplicate_links:
+                existing_link = db.execute(
+                    select(WorkspaceContactSQLModel).where(
+                        WorkspaceContactSQLModel.workspace_id == link.workspace_id,
+                        WorkspaceContactSQLModel.contact_id == canonical.id,
+                    )
+                ).scalars().first()
+                if existing_link:
+                    db.delete(link)
+                else:
+                    link.contact_id = canonical.id
+                    db.add(link)
+
+            db.delete(duplicate)
+            by_id.pop(str(duplicate.id), None)
+            merged_count += 1
+
+        db.add(canonical)
+
+    return int(merged_count)
+
+
+@app.get("/api/contacts")
+def get_contacts(db: Session = Depends(get_db_session)):
+    """Get known individual contacts (not groups)."""
+    ensure_workspace_flow_schema(db)
+    normalized = _normalize_contact_primary_chat_ids(db)
+    if any(int(normalized.get(key, 0)) > 0 for key in ("deduped", "promoted", "merged_conflicts")):
+        db.commit()
+    contacts = db.execute(
+        select(WhatsAppContactSQLModel)
+        .where(~WhatsAppContactSQLModel.chat_id.like("%@g.us"))
+        .order_by(WhatsAppContactSQLModel.last_seen_at.desc().nullslast(), WhatsAppContactSQLModel.created_at.desc())
+    ).scalars().all()
+    return {
+        "contacts": [_serialize_contact_ref(contact) for contact in contacts],
+        "total": len(contacts),
+    }
+
+
+@app.post("/api/contacts/sync")
+def sync_contacts(
+    allow_fallback: bool = Query(default=False),
+    db: Session = Depends(get_db_session),
+):
+    """Sync contacts from WAHA contacts store. Optional fallback to Redis conversation keys."""
+    ensure_workspace_flow_schema(db)
+    waha_stats = _sync_contacts_from_waha(db)
+    fallback_synced = 0
+    source = "waha"
+    fallback_reason = None
+
+    if int(waha_stats.get("fetched", 0)) == 0:
+        if allow_fallback:
+            fallback_synced = _sync_contacts_from_conversation_keys(db)
+            source = "conversation_fallback"
+        else:
+            source = "waha_only_no_fallback"
+            fallback_reason = "WAHA returned 0 contacts; fallback disabled"
+
+    normalized = _normalize_contact_primary_chat_ids(db)
+    db.commit()
+    contacts = db.execute(
+        select(WhatsAppContactSQLModel).where(~WhatsAppContactSQLModel.chat_id.like("%@g.us"))
+    ).scalars().all()
+    return {
+        "status": "success",
+        "source": source,
+        "fetched": int(waha_stats.get("fetched", 0)),
+        "synced": int(waha_stats.get("synced", 0)) + int(fallback_synced),
+        "fallback_synced": int(fallback_synced),
+        "fallback_enabled": bool(allow_fallback),
+        "fallback_reason": fallback_reason,
+        "deduped": int(normalized.get("deduped", 0)),
+        "promoted": int(normalized.get("promoted", 0)),
+        "merged_conflicts": int(normalized.get("merged_conflicts", 0)),
+        "total": len(contacts),
+    }
+
+
 @app.post("/api/groups/{group_id}/flows/{flow_id}")
 def assign_flow(group_id: str, flow_id: str, db: Session = Depends(get_db_session)):
     """Assign a flow to a group"""
+    group_uuid = uuid.UUID(group_id)
+    flow_uuid = uuid.UUID(flow_id)
+
     # Check if assignment already exists
-    existing = db.query(FlowGroup).filter(
-        FlowGroup.group_id == group_id,
-        FlowGroup.flow_id == flow_id
-    ).first()
+    existing = db.execute(
+        select(FlowGroupSQLModel).where(
+            FlowGroupSQLModel.group_id == group_uuid,
+            FlowGroupSQLModel.flow_id == flow_uuid,
+        )
+    ).scalars().first()
     
     if existing:
         return {"status": "success", "message": "Flow already assigned"}
     
     # Create new assignment
-    new_assignment = FlowGroup(group_id=group_id, flow_id=flow_id)
+    new_assignment = FlowGroupSQLModel(group_id=group_uuid, flow_id=flow_uuid)
     db.add(new_assignment)
     db.commit()
     
@@ -2295,10 +2983,14 @@ def assign_flow(group_id: str, flow_id: str, db: Session = Depends(get_db_sessio
 @app.delete("/api/groups/{group_id}/flows/{flow_id}")
 def unassign_flow(group_id: str, flow_id: str, db: Session = Depends(get_db_session)):
     """Remove a flow assignment from a group"""
-    db.query(FlowGroup).filter(
-        FlowGroup.group_id == group_id,
-        FlowGroup.flow_id == flow_id
-    ).delete()
+    group_uuid = uuid.UUID(group_id)
+    flow_uuid = uuid.UUID(flow_id)
+    db.execute(
+        delete(FlowGroupSQLModel).where(
+            FlowGroupSQLModel.group_id == group_uuid,
+            FlowGroupSQLModel.flow_id == flow_uuid,
+        )
+    )
     db.commit()
     
     return {"status": "success", "message": "Flow unassigned successfully"}
@@ -2319,9 +3011,9 @@ def sync_groups(db: Session = Depends(get_db_session)):
         
         for waha_group in waha_groups:
             # Check if group exists
-            existing_group = db.query(WhatsAppGroup).filter(
-                WhatsAppGroup.chat_id == waha_group["chat_id"]
-            ).first()
+            existing_group = db.execute(
+                select(WhatsAppGroupSQLModel).where(WhatsAppGroupSQLModel.chat_id == waha_group["chat_id"])
+            ).scalars().first()
             
             if existing_group:
                 # Update existing group
@@ -2333,7 +3025,7 @@ def sync_groups(db: Session = Depends(get_db_session)):
                 updated_count += 1
             else:
                 # Create new group
-                new_group = WhatsAppGroup(
+                new_group = WhatsAppGroupSQLModel(
                     chat_id=waha_group["chat_id"],
                     name=waha_group["name"],
                     description=waha_group["description"],
@@ -2369,7 +3061,9 @@ def toggle_group(group_id: str, db: Session = Depends(get_db_session)):
         group_id: UUID of the group
     """
     try:
-        group = db.query(WhatsAppGroup).filter(WhatsAppGroup.id == group_id).first()
+        group = db.execute(
+            select(WhatsAppGroupSQLModel).where(WhatsAppGroupSQLModel.id == uuid.UUID(group_id))
+        ).scalars().first()
         
         if not group:
             raise HTTPException(status_code=404, detail="Group not found")
@@ -2397,7 +3091,9 @@ def toggle_group(group_id: str, db: Session = Depends(get_db_session)):
 @app.get("/api/groups/{group_id}")
 def get_group(group_id: str, db: Session = Depends(get_db_session)):
     """Get details of a specific group"""
-    group = db.query(WhatsAppGroup).filter(WhatsAppGroup.id == group_id).first()
+    group = db.execute(
+        select(WhatsAppGroupSQLModel).where(WhatsAppGroupSQLModel.id == uuid.UUID(group_id))
+    ).scalars().first()
     
     if not group:
         raise HTTPException(status_code=404, detail="Group not found")
@@ -2470,18 +3166,19 @@ def infer_trigger_type_from_definition(definition: Dict[str, Any], fallback: str
 def get_flows(workspace_id: Optional[str] = None, db: Session = Depends(get_db_session)):
     """List all flows, optionally filtered by workspace"""
     ensure_workspace_flow_schema(db)
-    query = db.query(Flow)
+    stmt = select(FlowSQLModel)
     if workspace_id:
         workspace_uuid = uuid.UUID(workspace_id)
-        query = query.outerjoin(
-            WorkspaceFlow, WorkspaceFlow.flow_id == Flow.id
-        ).filter(
+        stmt = stmt.outerjoin(
+            WorkspaceFlowSQLModel, WorkspaceFlowSQLModel.flow_id == FlowSQLModel.id
+        ).where(
             or_(
-                WorkspaceFlow.workspace_id == workspace_uuid,
-                Flow.workspace_id == workspace_uuid,  # legacy fallback
+                WorkspaceFlowSQLModel.workspace_id == workspace_uuid,
+                FlowSQLModel.workspace_id == workspace_uuid,  # legacy fallback
             )
         ).distinct()
-    flows = query.order_by(Flow.created_at.asc()).all()
+    stmt = stmt.order_by(FlowSQLModel.created_at.asc())
+    flows = db.execute(stmt).scalars().all()
 
     usage_map = _get_flow_workspace_usage(db, flows)
     result = [_serialize_flow(flow, usage_map.get(flow.id, [])) for flow in flows]
@@ -2509,7 +3206,7 @@ def create_flow(flow_data: FlowCreate, db: Session = Depends(get_db_session)):
         requested_workspace_ids.append(flow_data.workspace_id)
     workspace_uuids = _parse_workspace_uuid_list(requested_workspace_ids) if requested_workspace_ids else []
 
-    new_flow = Flow(
+    new_flow = FlowSQLModel(
         workspace_id=None,  # logic layer ownership is decoupled from workspace usage
         name=flow_data.name,
         description=flow_data.description,
@@ -2525,7 +3222,9 @@ def create_flow(flow_data: FlowCreate, db: Session = Depends(get_db_session)):
     if workspace_uuids:
         existing_workspace_ids = {
             row[0]
-            for row in db.query(Workspace.id).filter(Workspace.id.in_(workspace_uuids)).all()
+            for row in db.execute(
+                select(WorkspaceSQLModel.id).where(WorkspaceSQLModel.id.in_(workspace_uuids))
+            ).all()
         }
         missing_workspace_ids = [str(ws_id) for ws_id in workspace_uuids if ws_id not in existing_workspace_ids]
         if missing_workspace_ids:
@@ -2543,7 +3242,9 @@ def create_flow(flow_data: FlowCreate, db: Session = Depends(get_db_session)):
 def get_flow(flow_id: str, db: Session = Depends(get_db_session)):
     """Get a specific flow with definition"""
     ensure_workspace_flow_schema(db)
-    flow = db.query(Flow).filter(Flow.id == flow_id).first()
+    flow = db.execute(
+        select(FlowSQLModel).where(FlowSQLModel.id == uuid.UUID(flow_id))
+    ).scalars().first()
     
     if not flow:
         raise HTTPException(status_code=404, detail="Flow not found")
@@ -2561,7 +3262,9 @@ def get_flow(flow_id: str, db: Session = Depends(get_db_session)):
 def update_flow(flow_id: str, flow_data: FlowUpdate, db: Session = Depends(get_db_session)):
     """Update an existing flow"""
     ensure_workspace_flow_schema(db)
-    flow = db.query(Flow).filter(Flow.id == flow_id).first()
+    flow = db.execute(
+        select(FlowSQLModel).where(FlowSQLModel.id == uuid.UUID(flow_id))
+    ).scalars().first()
     
     if not flow:
         raise HTTPException(status_code=404, detail="Flow not found")
@@ -2586,12 +3289,16 @@ def update_flow(flow_id: str, flow_data: FlowUpdate, db: Session = Depends(get_d
         workspace_uuids = _parse_workspace_uuid_list(flow_data.workspace_ids or [])
         existing_workspace_ids = {
             row[0]
-            for row in db.query(Workspace.id).filter(Workspace.id.in_(workspace_uuids)).all()
+            for row in db.execute(
+                select(WorkspaceSQLModel.id).where(WorkspaceSQLModel.id.in_(workspace_uuids))
+            ).all()
         }
         missing_workspace_ids = [str(ws_id) for ws_id in workspace_uuids if ws_id not in existing_workspace_ids]
         if missing_workspace_ids:
             raise HTTPException(status_code=404, detail=f"Workspace not found: {', '.join(missing_workspace_ids)}")
-        db.query(WorkspaceFlow).filter(WorkspaceFlow.flow_id == flow.id).delete(synchronize_session=False)
+        db.execute(
+            delete(WorkspaceFlowSQLModel).where(WorkspaceFlowSQLModel.flow_id == flow.id)
+        )
         for workspace_uuid in workspace_uuids:
             _attach_flow_to_workspace(db, workspace_uuid, flow.id)
 
@@ -2599,12 +3306,16 @@ def update_flow(flow_id: str, flow_data: FlowUpdate, db: Session = Depends(get_d
         # Legacy compatibility: workspace_id now means "attach one" (or clear all if null).
         if flow_data.workspace_id:
             workspace_uuid = uuid.UUID(flow_data.workspace_id)
-            workspace_exists = db.query(Workspace.id).filter(Workspace.id == workspace_uuid).first()
+            workspace_exists = db.execute(
+                select(WorkspaceSQLModel.id).where(WorkspaceSQLModel.id == workspace_uuid)
+            ).first()
             if not workspace_exists:
                 raise HTTPException(status_code=404, detail="Workspace not found")
             _attach_flow_to_workspace(db, workspace_uuid, flow.id)
         else:
-            db.query(WorkspaceFlow).filter(WorkspaceFlow.flow_id == flow.id).delete(synchronize_session=False)
+            db.execute(
+                delete(WorkspaceFlowSQLModel).where(WorkspaceFlowSQLModel.flow_id == flow.id)
+            )
 
     # Legacy column is not the source of truth anymore.
     flow.workspace_id = None
@@ -2621,11 +3332,15 @@ def attach_workspace_flow(workspace_id: str, flow_id: str, db: Session = Depends
     workspace_uuid = uuid.UUID(workspace_id)
     flow_uuid = uuid.UUID(flow_id)
 
-    workspace_exists = db.query(Workspace.id).filter(Workspace.id == workspace_uuid).first()
+    workspace_exists = db.execute(
+        select(WorkspaceSQLModel.id).where(WorkspaceSQLModel.id == workspace_uuid)
+    ).first()
     if not workspace_exists:
         raise HTTPException(status_code=404, detail="Workspace not found")
 
-    flow_exists = db.query(Flow.id).filter(Flow.id == flow_uuid).first()
+    flow_exists = db.execute(
+        select(FlowSQLModel.id).where(FlowSQLModel.id == flow_uuid)
+    ).first()
     if not flow_exists:
         raise HTTPException(status_code=404, detail="Flow not found")
 
@@ -2647,10 +3362,12 @@ def detach_workspace_flow(workspace_id: str, flow_id: str, db: Session = Depends
     workspace_uuid = uuid.UUID(workspace_id)
     flow_uuid = uuid.UUID(flow_id)
 
-    deleted = db.query(WorkspaceFlow).filter(
-        WorkspaceFlow.workspace_id == workspace_uuid,
-        WorkspaceFlow.flow_id == flow_uuid,
-    ).delete(synchronize_session=False)
+    deleted = db.execute(
+        delete(WorkspaceFlowSQLModel).where(
+            WorkspaceFlowSQLModel.workspace_id == workspace_uuid,
+            WorkspaceFlowSQLModel.flow_id == flow_uuid,
+        )
+    )
     db.commit()
 
     return {
@@ -2658,14 +3375,16 @@ def detach_workspace_flow(workspace_id: str, flow_id: str, db: Session = Depends
         "message": "Logic layer detached from workspace",
         "workspace_id": workspace_id,
         "flow_id": flow_id,
-        "detached": bool(deleted),
+        "detached": bool(getattr(deleted, "rowcount", 0)),
     }
 
 
 @app.delete("/api/flows/{flow_id}")
 def delete_flow(flow_id: str, db: Session = Depends(get_db_session)):
     """Delete a flow"""
-    flow = db.query(Flow).filter(Flow.id == flow_id).first()
+    flow = db.execute(
+        select(FlowSQLModel).where(FlowSQLModel.id == uuid.UUID(flow_id))
+    ).scalars().first()
     
     if not flow:
         raise HTTPException(status_code=404, detail="Flow not found")
@@ -2686,15 +3405,19 @@ def get_executions(
     """
     Get execution logs, optionally filtered by flow_id
     """
-    query = db.query(FlowExecution)
-    
+    count_stmt = select(func.count()).select_from(FlowExecutionSQLModel)
+    stmt = select(FlowExecutionSQLModel)
+
     if flow_id:
-        query = query.filter(FlowExecution.flow_id == flow_id)
-        
-    total = query.count()
-    
-    executions = query.order_by(FlowExecution.started_at.desc()) \
-                      .offset(offset).limit(limit).all()
+        flow_uuid = uuid.UUID(flow_id)
+        count_stmt = count_stmt.where(FlowExecutionSQLModel.flow_id == flow_uuid)
+        stmt = stmt.where(FlowExecutionSQLModel.flow_id == flow_uuid)
+
+    total = db.execute(count_stmt).scalar() or 0
+
+    executions = db.execute(
+        stmt.order_by(FlowExecutionSQLModel.started_at.desc()).offset(offset).limit(limit)
+    ).scalars().all()
     
     result = []
     for exec in executions:
@@ -2715,6 +3438,81 @@ def get_executions(
         "offset": offset
     }
 
+
+@app.delete("/api/executions/{execution_id}")
+def delete_execution_log(execution_id: str, db: Session = Depends(get_db_session)):
+    """Delete a single execution log row by id."""
+    try:
+        execution_uuid = uuid.UUID(execution_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid execution id format")
+
+    execution = db.execute(
+        select(FlowExecutionSQLModel).where(FlowExecutionSQLModel.id == execution_uuid)
+    ).scalars().first()
+    if not execution:
+        raise HTTPException(status_code=404, detail="Execution not found")
+
+    db.delete(execution)
+    db.commit()
+    return {"status": "success", "deleted_id": execution_id}
+
+
+@app.post("/api/executions/bulk-delete")
+def bulk_delete_execution_logs(payload: ExecutionBulkDeleteRequest, db: Session = Depends(get_db_session)):
+    """Delete many execution logs in one request."""
+    raw_ids = [str(item).strip() for item in payload.execution_ids if str(item).strip()]
+    if not raw_ids:
+        raise HTTPException(status_code=422, detail="execution_ids must contain at least one id")
+
+    unique_ids = list(dict.fromkeys(raw_ids))
+    parsed_ids: List[uuid.UUID] = []
+    invalid_ids: List[str] = []
+    for raw_id in unique_ids:
+        try:
+            parsed_ids.append(uuid.UUID(raw_id))
+        except ValueError:
+            invalid_ids.append(raw_id)
+
+    if invalid_ids:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid execution id(s): {', '.join(invalid_ids)}",
+        )
+
+    delete_stmt = delete(FlowExecutionSQLModel).where(FlowExecutionSQLModel.id.in_(parsed_ids))
+    result = db.execute(delete_stmt)
+    db.commit()
+    deleted_count = max(int(result.rowcount or 0), 0)
+    return {
+        "status": "success",
+        "requested_count": len(parsed_ids),
+        "deleted_count": deleted_count,
+    }
+
+
+@app.delete("/api/executions")
+def clear_execution_logs(
+    flow_id: Optional[str] = Query(None),
+    db: Session = Depends(get_db_session),
+):
+    """Clear all execution logs, optionally scoped to a specific flow."""
+    delete_stmt = delete(FlowExecutionSQLModel)
+    scope = "all"
+
+    if flow_id:
+        try:
+            flow_uuid = uuid.UUID(flow_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid flow id format")
+        delete_stmt = delete_stmt.where(FlowExecutionSQLModel.flow_id == flow_uuid)
+        scope = f"flow:{flow_id}"
+
+    result = db.execute(delete_stmt)
+    db.commit()
+    deleted_count = max(int(result.rowcount or 0), 0)
+    return {"status": "success", "scope": scope, "deleted_count": deleted_count}
+
 @app.get("/api/flows/{flow_id}/executions")
 def get_flow_executions(
     flow_id: str,
@@ -2727,7 +3525,9 @@ def get_flow_executions(
 @app.post("/api/flows/{flow_id}/test")
 async def test_flow(flow_id: str, db: Session = Depends(get_db_session)):
     """Test a flow with a dummy payload"""
-    flow = db.query(Flow).filter(Flow.id == flow_id).first()
+    flow = db.execute(
+        select(FlowSQLModel).where(FlowSQLModel.id == uuid.UUID(flow_id))
+    ).scalars().first()
     if not flow:
         raise HTTPException(status_code=404, detail="Flow not found")
         
@@ -2758,7 +3558,9 @@ async def test_flow(flow_id: str, db: Session = Depends(get_db_session)):
 def toggle_workspace(workspace_id: str, db: Session = Depends(get_db_session)):
     """Toggle workspace active status"""
     try:
-        workspace = db.query(Workspace).filter(Workspace.id == workspace_id).first()
+        workspace = db.execute(
+            select(WorkspaceSQLModel).where(WorkspaceSQLModel.id == uuid.UUID(workspace_id))
+        ).scalars().first()
         if not workspace:
             raise HTTPException(status_code=404, detail="Workspace not found")
         
@@ -2783,7 +3585,9 @@ def toggle_workspace(workspace_id: str, db: Session = Depends(get_db_session)):
 def set_workspace_status(workspace_id: str, data: WorkspaceStatusUpdate, db: Session = Depends(get_db_session)):
     """Set workspace active status explicitly to avoid accidental inverse toggles."""
     try:
-        workspace = db.query(Workspace).filter(Workspace.id == workspace_id).first()
+        workspace = db.execute(
+            select(WorkspaceSQLModel).where(WorkspaceSQLModel.id == uuid.UUID(workspace_id))
+        ).scalars().first()
         if not workspace:
             raise HTTPException(status_code=404, detail="Workspace not found")
 
@@ -2801,4 +3605,49 @@ def set_workspace_status(workspace_id: str, data: WorkspaceStatusUpdate, db: Ses
     except Exception as e:
         db.rollback()
         print(f"❌ Error setting workspace status: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/workspaces/{workspace_id}/status/set")
+def set_workspace_status_get(
+    workspace_id: str,
+    is_active: str = Query(...),
+    db: Session = Depends(get_db_session),
+):
+    """
+    CORS-safe fallback for environments where PATCH preflight is blocked and
+    browser never sends the actual mutation request.
+    """
+    raw_flag = (is_active or "").strip().lower()
+    if raw_flag in {"1", "true", "yes", "on"}:
+        parsed_is_active = True
+    elif raw_flag in {"0", "false", "no", "off"}:
+        parsed_is_active = False
+    else:
+        raise HTTPException(
+            status_code=422,
+            detail="is_active must be one of: true/false/1/0/yes/no/on/off",
+        )
+
+    try:
+        workspace = db.execute(
+            select(WorkspaceSQLModel).where(WorkspaceSQLModel.id == uuid.UUID(workspace_id))
+        ).scalars().first()
+        if not workspace:
+            raise HTTPException(status_code=404, detail="Workspace not found")
+
+        workspace.is_active = parsed_is_active
+        workspace.updated_at = datetime.now()
+        db.commit()
+
+        return {
+            "status": "success",
+            "workspace_id": str(workspace.id),
+            "is_active": workspace.is_active
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        print(f"❌ Error setting workspace status via GET fallback: {e}")
         raise HTTPException(status_code=500, detail=str(e))

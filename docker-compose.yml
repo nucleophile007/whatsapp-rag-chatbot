@@ -27,7 +27,7 @@ services:
     networks:
       - async_rag_network
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U flowbuilder" ]
+      test: [ "CMD-SHELL", "pg_isready -U flowbuilder -d whatsapp_flows" ]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -40,7 +40,7 @@ services:
     ports:
       - "5172:5173"
     environment:
-      - VITE_API_URL=http://localhost:8000
+      - VITE_PROXY_TARGET=http://server:8000
     volumes:
       - ./frontend:/app
       - /app/node_modules
@@ -71,7 +71,18 @@ services:
       - REDIS_HOST=valkey
       - REDIS_PORT=6379
       - QDRANT_URL=http://qdrant:6333
+      - WAHA_URL=http://waha:3000
+      - WAHA_SESSION=default
+      - WAHA_API_KEY=Yahoo
+      - WAHA_WEBHOOK_URL=http://server:8000/whatsapp/webhook?waha_instance=default
+      # - WAHA_INSTANCE_MAP={"default":{"url":"http://waha:3000","session":"default"},"default2":{"url":"http://waha2:3000","session":"default"}}
+      - WAHA_INSTANCE_MAP={"default":{"url":"http://waha:3000","session":"default"}}
       - DATABASE_URL=postgresql://flowbuilder:flowbuilder123@postgres:5432/whatsapp_flows
+      - RAG_GROUNDING_THRESHOLD=0.46
+      - RAG_FINAL_CONTEXT_K=8
+      - RAG_RETRIEVAL_CANDIDATES=22
+      - RAG_REQUIRE_CITATIONS=false
+      - CONVERSATION_MEMORY_SCOPE=client_workspace
     env_file:
       - .env
     volumes:
@@ -97,7 +108,10 @@ services:
       - OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES
       # WAHA (WhatsApp) Configuration
       - WAHA_URL=http://waha:3000
+      - WAHA_SESSION=default
       - WAHA_API_KEY=Yahoo
+      # - WAHA_INSTANCE_MAP={"default":{"url":"http://waha:3000","session":"default"},"default2":{"url":"http://waha2:3000","session":"default"}}
+      - WAHA_INSTANCE_MAP={"default":{"url":"http://waha:3000","session":"default"}}
       - DATABASE_URL=postgresql://flowbuilder:flowbuilder123@postgres:5432/whatsapp_flows
       - RQ_WORKER_DEFAULT_COUNT=1
       - RQ_WORKER_MIN_COUNT=1
@@ -105,6 +119,11 @@ services:
       - RQ_WORKER_DESIRED_KEY=rq:workers:desired_count
       - RQ_WORKER_MANAGER_HEARTBEAT_KEY=rq:workers:manager:heartbeat
       - RQ_WORKER_MANAGER_HEARTBEAT_TTL_SECONDS=15
+      - RAG_GROUNDING_THRESHOLD=0.46
+      - RAG_FINAL_CONTEXT_K=8
+      - RAG_RETRIEVAL_CANDIDATES=22
+      - RAG_REQUIRE_CITATIONS=false
+      - CONVERSATION_MEMORY_SCOPE=client_workspace
     env_file:
       - .env
     volumes:
@@ -113,6 +132,7 @@ services:
       - valkey
       - qdrant
       - waha
+      # - waha2
       - postgres
     networks:
       - async_rag_network
@@ -120,6 +140,7 @@ services:
 
   waha:
     image: devlikeapro/waha:latest
+    platform: linux/amd64
     container_name: waha
     restart: always
     ports:
@@ -127,7 +148,7 @@ services:
     environment:
       WAHA_API_KEY: "Yahoo"
       WHATSAPP_DEFAULT_ENGINE: "NOWEB"
-      WAHA_WEBHOOK_URL: "http://server:8000/whatsapp/webhook"
+      WAHA_WEBHOOK_URL: "http://server:8000/whatsapp/webhook?waha_instance=default"
       WAHA_DASHBOARD_USERNAME: "admin"
       WAHA_DASHBOARD_PASSWORD: "secret123"
       WHATSAPP_SWAGGER_USERNAME: "admin"
@@ -137,6 +158,25 @@ services:
     networks:
       - async_rag_network
 
+  # waha2:
+  #   image: devlikeapro/waha:latest
+  #   container_name: waha2
+  #   restart: always
+  #   ports:
+  #     - "3001:3000"
+  #   environment:
+  #     WAHA_API_KEY: "Yahoo"
+  #     WHATSAPP_DEFAULT_ENGINE: "NOWEB"
+  #     WAHA_WEBHOOK_URL: "http://server:8000/whatsapp/webhook?waha_instance=default2"
+  #     WAHA_DASHBOARD_USERNAME: "admin"
+  #     WAHA_DASHBOARD_PASSWORD: "secret123"
+  #     WHATSAPP_SWAGGER_USERNAME: "admin"
+  #     WHATSAPP_SWAGGER_PASSWORD: "secret123"
+  #   volumes:
+  #     - ./sessions2:/app/.sessions
+  #   networks:
+  #     - async_rag_network
+
 networks:
   async_rag_network:
     driver: bridge
@@ -144,4 +184,3 @@ networks:
 volumes:
   qdrant_storage:
   postgres_data:
-

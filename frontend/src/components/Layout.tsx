@@ -5,9 +5,9 @@ import {
   Database,
   Layers,
   Workflow,
+  BrainCircuit,
   Sparkles,
   ChevronRight,
-  Code2,
 } from "lucide-react";
 import { cn } from "../lib/utils";
 
@@ -16,7 +16,7 @@ const navigation = [
   { name: "Workspaces", href: "/workspaces", icon: Layers, info: "AI environments" },
   { name: "Logic Layers", href: "/logic-layers", icon: Workflow, info: "All automations" },
   { name: "Knowledge", href: "/knowledge-base", icon: Database, info: "Documents" },
-  { name: "Client API", href: "/client-api", icon: Code2, info: "Chat endpoint + docs" },
+  { name: "Memory", href: "/memory", icon: BrainCircuit, info: "STM + LTM debug" },
   { name: "Executions", href: "/executions", icon: FileText, info: "Runtime logs" },
 ];
 
@@ -41,7 +41,7 @@ export default function Layout() {
       <div className="app-shell mx-auto flex min-h-[calc(100vh-24px)] max-w-[1500px] overflow-hidden md:min-h-[calc(100vh-40px)]">
         <aside className="hidden w-72 shrink-0 border-r border-border/60 bg-white/80 p-5 lg:flex lg:flex-col">
           <Link to="/" className="mb-8 flex items-center gap-3">
-            <div className="animate-float flex h-11 w-11 items-center justify-center rounded-2xl bg-gradient-to-br from-cyan-600 to-teal-500 text-white shadow-lg">
+            <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-gradient-to-br from-cyan-600 to-teal-500 text-white shadow">
               <Sparkles className="h-5 w-5" />
             </div>
             <div>
@@ -51,15 +51,14 @@ export default function Layout() {
           </Link>
 
           <nav className="space-y-1.5">
-            {navigation.map((item, index) => {
+            {navigation.map((item) => {
               const active = isActivePath(location.pathname, item.href);
               return (
                 <Link
                   key={item.name}
                   to={item.href}
-                  style={{ animationDelay: `${index * 60}ms` }}
                   className={cn(
-                    "animate-rise group flex items-center gap-3 rounded-xl px-3 py-2.5 transition-all",
+                    "group flex items-center gap-3 rounded-xl px-3 py-2.5 transition-colors",
                     active
                       ? "bg-primary text-primary-foreground shadow-md"
                       : "hover:bg-secondary text-muted-foreground hover:text-foreground"
@@ -85,7 +84,7 @@ export default function Layout() {
         </aside>
 
         <div className="flex min-w-0 flex-1 flex-col">
-          <header className="flex h-16 items-center justify-between border-b border-border/60 bg-white/70 px-4 backdrop-blur md:px-6">
+          <header className="flex h-16 items-center justify-between border-b border-border/60 bg-white px-4 md:px-6">
             <div>
               <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">Workspace Surface</p>
               <h2 className="text-lg font-bold md:text-xl">{currentLabel}</h2>
@@ -101,7 +100,7 @@ export default function Layout() {
           </main>
         </div>
 
-        <nav className="fixed bottom-3 left-1/2 z-20 flex -translate-x-1/2 gap-1 rounded-2xl border bg-white/92 p-1 shadow-xl backdrop-blur lg:hidden">
+        <nav className="fixed bottom-3 left-1/2 z-20 flex -translate-x-1/2 gap-1 rounded-2xl border bg-white p-1 shadow-lg lg:hidden">
           {navigation.map((item) => {
             const active = isActivePath(location.pathname, item.href);
             return (

@@ -1,6 +1,6 @@
-import React, { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
-import { getExecutions } from "../lib/api";
+import React, { useMemo, useState } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { clearExecutions, deleteExecutionsBulk, getExecutions } from "../lib/api";
 import {
   Loader2,
   Activity,
@@ -11,9 +11,9 @@ import {
   ChevronDown,
   ChevronRight,
   Radar,
+  Trash2,
 } from "lucide-react";
 import { cn } from "../lib/utils";
-import ReactJson from "react-json-view";
 import type { ExecutionRecord } from "../lib/types";
 
 function parseNodesExecuted(nodes: ExecutionRecord["nodes_executed"]): unknown[] {
@@ -30,14 +30,84 @@ function parseNodesExecuted(nodes: ExecutionRecord["nodes_executed"]): unknown[]
   return [];
 }
 
+function renderPrettyJson(value: unknown): string {
+  try {
+    return JSON.stringify(value ?? {}, null, 2);
+  } catch {
+    return "{}";
+  }
+}
+
 export default function ExecutionLogs() {
+  const queryClient = useQueryClient();
   const [expandedRow, setExpandedRow] = useState<string | null>(null);
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
 
   const { data, isLoading, error, isFetching } = useQuery({
     queryKey: ["executions"],
-    queryFn: () => getExecutions({ limit: 50 }),
-    refetchInterval: 5000,
+    queryFn: () => getExecutions({ limit: 30 }),
+    refetchInterval: 10000,
+    refetchOnWindowFocus: false,
   });
+
+  const executions = data?.executions ?? [];
+  const selectedIdSet = useMemo(() => new Set(selectedIds), [selectedIds]);
+  const activeSelectedIds = useMemo(
+    () => selectedIds.filter((id) => executions.some((execution) => execution.id === id)),
+    [selectedIds, executions]
+  );
+  const isAllVisibleSelected =
+    executions.length > 0 && executions.every((execution) => selectedIdSet.has(execution.id));
+
+  const bulkDeleteMutation = useMutation({
+    mutationFn: (executionIds: string[]) => deleteExecutionsBulk(executionIds),
+    onSuccess: () => {
+      setSelectedIds([]);
+      setExpandedRow(null);
+      queryClient.invalidateQueries({ queryKey: ["executions"] });
+    },
+  });
+
+  const clearLogsMutation = useMutation({
+    mutationFn: () => clearExecutions(),
+    onSuccess: () => {
+      setSelectedIds([]);
+      setExpandedRow(null);
+      queryClient.invalidateQueries({ queryKey: ["executions"] });
+    },
+  });
+
+  const toggleSelectOne = (executionId: string) => {
+    setSelectedIds((prev) =>
+      prev.includes(executionId) ? prev.filter((id) => id !== executionId) : [...prev, executionId]
+    );
+  };
+
+  const toggleSelectAllVisible = () => {
+    if (isAllVisibleSelected) {
+      setSelectedIds([]);
+      return;
+    }
+    setSelectedIds(executions.map((execution) => execution.id));
+  };
+
+  const handleDeleteSelected = () => {
+    if (activeSelectedIds.length === 0) return;
+    const confirmed = window.confirm(
+      `Delete ${activeSelectedIds.length} selected log${activeSelectedIds.length > 1 ? "s" : ""}?`
+    );
+    if (!confirmed) return;
+    bulkDeleteMutation.mutate(activeSelectedIds);
+  };
+
+  const handleClearLogs = () => {
+    if (executions.length === 0) return;
+    const confirmed = window.confirm(
+      "Clear all execution logs currently listed? This action cannot be undone."
+    );
+    if (!confirmed) return;
+    clearLogsMutation.mutate();
+  };
 
   if (isLoading && !data) {
     return (
@@ -57,7 +127,6 @@ export default function ExecutionLogs() {
     );
   }
 
-  const executions = data?.executions || [];
   const toggleRow = (id: string) => setExpandedRow((prev) => (prev === id ? null : id));
 
   return (
@@ -74,16 +143,60 @@ export default function ExecutionLogs() {
 
         <div className="tag border-slate-200 bg-white text-slate-600">
           {isFetching ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <span className="h-2 w-2 rounded-full bg-emerald-500" />}
-          {isFetching ? "Refreshing" : "Auto refresh: 5s"}
+          {isFetching ? "Refreshing" : "Auto refresh: 10s"}
         </div>
       </section>
 
       <section className="panel animate-rise overflow-hidden">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border/70 bg-secondary/20 px-4 py-3">
+          <p className="text-xs text-muted-foreground">
+            {activeSelectedIds.length > 0
+              ? `${activeSelectedIds.length} selected`
+              : `${executions.length} logs loaded`}
+          </p>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={handleDeleteSelected}
+              disabled={activeSelectedIds.length === 0 || bulkDeleteMutation.isPending || clearLogsMutation.isPending}
+              className="btn-secondary px-3 py-2 text-xs text-destructive disabled:opacity-50"
+            >
+              {bulkDeleteMutation.isPending ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Trash2 className="h-3.5 w-3.5" />
+              )}
+              Delete Selected
+            </button>
+            <button
+              type="button"
+              onClick={handleClearLogs}
+              disabled={executions.length === 0 || clearLogsMutation.isPending || bulkDeleteMutation.isPending}
+              className="btn-secondary px-3 py-2 text-xs text-destructive disabled:opacity-50"
+            >
+              {clearLogsMutation.isPending ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Trash2 className="h-3.5 w-3.5" />
+              )}
+              Clear Logs
+            </button>
+          </div>
+        </div>
         <div className="overflow-x-auto">
           <table className="min-w-full text-left text-sm">
             <thead className="border-b bg-secondary/40 text-xs uppercase tracking-wide text-muted-foreground">
               <tr>
                 <th className="px-4 py-3 w-8" />
+                <th className="px-3 py-3 w-10">
+                  <input
+                    type="checkbox"
+                    aria-label="Select all visible logs"
+                    checked={isAllVisibleSelected}
+                    onChange={toggleSelectAllVisible}
+                    className="h-4 w-4 rounded border-border"
+                  />
+                </th>
                 <th className="px-4 py-3">Status</th>
                 <th className="px-4 py-3">Component</th>
                 <th className="px-4 py-3">Source</th>
@@ -116,6 +229,16 @@ export default function ExecutionLogs() {
                         >
                           {isExpanded ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
                         </button>
+                      </td>
+
+                      <td className="px-3 py-3">
+                        <input
+                          type="checkbox"
+                          aria-label={`Select execution ${exec.id}`}
+                          checked={selectedIdSet.has(exec.id)}
+                          onChange={() => toggleSelectOne(exec.id)}
+                          className="h-4 w-4 rounded border-border"
+                        />
                       </td>
 
                       <td className="px-4 py-3">
@@ -156,30 +279,18 @@ export default function ExecutionLogs() {
 
                     {isExpanded && (
                       <tr className="border-b border-border/60 bg-secondary/20">
-                        <td colSpan={6} className="px-4 py-4">
+                        <td colSpan={7} className="px-4 py-4">
                           <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
                             <div className="panel overflow-auto p-3">
                               <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Trigger Data</h4>
-                              <ReactJson
-                                src={exec.trigger_data}
-                                name={false}
-                                displayDataTypes={false}
-                                enableClipboard={false}
-                                collapsed={1}
-                                style={{ fontSize: "12px", background: "transparent" }}
-                              />
+                              <pre className="overflow-auto text-xs text-foreground">{renderPrettyJson(exec.trigger_data)}</pre>
                             </div>
 
                             <div className="panel overflow-auto p-3">
                               <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Execution Steps</h4>
-                              <ReactJson
-                                src={parseNodesExecuted(exec.nodes_executed)}
-                                name={false}
-                                displayDataTypes={false}
-                                enableClipboard={false}
-                                collapsed={1}
-                                style={{ fontSize: "12px", background: "transparent" }}
-                              />
+                              <pre className="overflow-auto text-xs text-foreground">
+                                {renderPrettyJson(parseNodesExecuted(exec.nodes_executed))}
+                              </pre>
                             </div>
                           </div>
                         </td>
@@ -191,7 +302,7 @@ export default function ExecutionLogs() {
 
               {executions.length === 0 && (
                 <tr>
-                  <td colSpan={6} className="px-6 py-16 text-center text-muted-foreground">
+                  <td colSpan={7} className="px-6 py-16 text-center text-muted-foreground">
                     No execution logs yet.
                   </td>
                 </tr>

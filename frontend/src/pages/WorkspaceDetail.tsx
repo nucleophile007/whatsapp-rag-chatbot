@@ -8,6 +8,8 @@ import {
   getCollections,
   getGroups,
   syncGroups,
+  getContacts,
+  syncContacts,
   getFlows,
   createFlow,
   attachFlowToWorkspace,
@@ -21,6 +23,8 @@ import {
   CheckCircle2,
   Bot,
   MessageSquare,
+  Filter,
+  Users,
   Save,
   RefreshCw,
   Zap,
@@ -32,9 +36,11 @@ import {
   CircleDot,
   PauseCircle,
   PlayCircle,
+  Search,
+  X,
 } from "lucide-react";
 import { cn } from "../lib/utils";
-import type { Collection, FlowCreateInput, FlowSummary, Group, WorkspaceFormInput } from "../lib/types";
+import type { Collection, Contact, FlowCreateInput, FlowSummary, Group, WorkspaceFormInput } from "../lib/types";
 
 export default function WorkspaceDetail() {
   const { id } = useParams<{ id: string }>();
@@ -43,6 +49,9 @@ export default function WorkspaceDetail() {
 
   const [draftByWorkspaceId, setDraftByWorkspaceId] = useState<Record<string, Partial<WorkspaceFormInput>>>({});
   const [selectedExistingFlowId, setSelectedExistingFlowId] = useState("");
+  const [manualContactInput, setManualContactInput] = useState("");
+  const [contactSearchTerm, setContactSearchTerm] = useState("");
+  const [showOnlyCompleteContacts, setShowOnlyCompleteContacts] = useState(false);
 
   const { data: workspace, isLoading: wsLoading, error: wsError } = useQuery({
     queryKey: ["workspace", id],
@@ -58,6 +67,11 @@ export default function WorkspaceDetail() {
   const { data: groupsData } = useQuery({
     queryKey: ["groups"],
     queryFn: getGroups,
+  });
+
+  const { data: contactsData } = useQuery({
+    queryKey: ["contacts"],
+    queryFn: getContacts,
   });
 
   const { data: flowsData, isLoading: flowsLoading } = useQuery({
@@ -120,6 +134,11 @@ export default function WorkspaceDetail() {
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["groups"] }),
   });
 
+  const syncContactsMutation = useMutation({
+    mutationFn: syncContacts,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["contacts"] }),
+  });
+
   const statusMutation = useMutation({
     mutationFn: (nextState: boolean) => setWorkspaceStatus({ id: id!, is_active: nextState }),
     onSuccess: () => {
@@ -168,6 +187,9 @@ export default function WorkspaceDetail() {
     knowledge_base_id: workspace.knowledge_base_id || "",
     system_prompt: workspace.system_prompt || "",
     user_prompt_template: workspace.user_prompt_template || "",
+    low_quality_clarification_text: workspace.low_quality_clarification_text || "",
+    contact_filter_mode: workspace.contact_filter_mode || "all",
+    contact_chat_ids: workspace.contacts?.map((contact) => contact.chat_id) || [],
     group_ids: workspace.groups?.map((group) => group.id) || [],
   };
 
@@ -177,6 +199,10 @@ export default function WorkspaceDetail() {
     knowledge_base_id: draft.knowledge_base_id ?? baseFormData.knowledge_base_id,
     system_prompt: draft.system_prompt ?? baseFormData.system_prompt,
     user_prompt_template: draft.user_prompt_template ?? baseFormData.user_prompt_template,
+    low_quality_clarification_text:
+      draft.low_quality_clarification_text ?? baseFormData.low_quality_clarification_text,
+    contact_filter_mode: draft.contact_filter_mode ?? baseFormData.contact_filter_mode,
+    contact_chat_ids: draft.contact_chat_ids ?? baseFormData.contact_chat_ids,
     group_ids: draft.group_ids ?? baseFormData.group_ids,
   };
 
@@ -187,6 +213,34 @@ export default function WorkspaceDetail() {
         ? currentGroupIds.filter((gid) => gid !== groupId)
         : [...currentGroupIds, groupId],
     });
+  };
+
+  const toggleContactSelection = (chatId: string) => {
+    const normalized = chatId.trim();
+    if (!normalized) return;
+    const current = formData.contact_chat_ids || [];
+    patchDraft({
+      contact_chat_ids: current.includes(normalized)
+        ? current.filter((id) => id !== normalized)
+        : [...current, normalized],
+    });
+  };
+
+  const addManualContact = () => {
+    const value = manualContactInput.trim();
+    if (!value) return;
+    const current = formData.contact_chat_ids || [];
+    if (current.includes(value)) {
+      setManualContactInput("");
+      return;
+    }
+    patchDraft({ contact_chat_ids: [...current, value] });
+    setManualContactInput("");
+  };
+
+  const removeManualContact = (chatId: string) => {
+    const current = formData.contact_chat_ids || [];
+    patchDraft({ contact_chat_ids: current.filter((id) => id !== chatId) });
   };
 
   const handleAddFlow = async () => {
@@ -215,9 +269,37 @@ export default function WorkspaceDetail() {
 
   const collections = collectionsData?.collections || [];
   const groups = groupsData?.groups || [];
+  const contacts = contactsData?.contacts || [];
   const flows = flowsData?.flows || [];
   const allFlows = allFlowsData?.flows || [];
   const attachableFlows = allFlows.filter((flow) => !id || !flow.workspace_ids.includes(id));
+  const normalizedContactSearch = contactSearchTerm.trim().toLowerCase();
+  const isCompleteContact = (contact: Contact): boolean => {
+    const name = (contact.display_name || "").trim();
+    const hasName = name.length > 0 && !/^\d+$/.test(name);
+    const phoneJid = (contact.phone_jid || "").trim().toLowerCase();
+    const wahaId = (contact.waha_contact_id || "").trim().toLowerCase();
+    const hasPhone = phoneJid.endsWith("@s.whatsapp.net");
+    const hasStableId = wahaId.endsWith("@c.us");
+    return hasName && (hasPhone || hasStableId);
+  };
+  const filteredContacts = contacts.filter((contact: Contact) => {
+    if (showOnlyCompleteContacts && !isCompleteContact(contact)) return false;
+    if (!normalizedContactSearch) return true;
+    const haystack = [
+      contact.display_name,
+      contact.phone_number,
+      contact.chat_id,
+      contact.lid,
+      contact.phone_jid,
+      contact.waha_contact_id,
+      contact.id,
+    ]
+      .filter(Boolean)
+      .map((value) => String(value).toLowerCase())
+      .join(" ");
+    return haystack.includes(normalizedContactSearch);
+  });
 
   return (
     <div className="mx-auto max-w-7xl space-y-6 p-5 md:p-8">
@@ -351,6 +433,22 @@ export default function WorkspaceDetail() {
                 />
                 <p className="text-xs text-muted-foreground">Variables: <code>{"{{body}}"}</code>, <code>{"{{rag_result}}"}</code></p>
               </label>
+
+              <label className="space-y-1.5">
+                <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                  Low-Quality Clarification Text
+                </span>
+                <textarea
+                  rows={3}
+                  value={formData.low_quality_clarification_text ?? ""}
+                  onChange={(event) => patchDraft({ low_quality_clarification_text: event.target.value })}
+                  className="input-base min-h-[96px] resize-y"
+                  placeholder="Message to send when query quality is too low (e.g., random/gibberish input)"
+                />
+                <p className="text-xs text-muted-foreground">
+                  Used when message quality is too low to answer. Leave empty to use global default.
+                </p>
+              </label>
             </div>
           </article>
 
@@ -391,6 +489,159 @@ export default function WorkspaceDetail() {
                   </button>
                 );
               })}
+            </div>
+
+            <div className="mt-6 border-t border-dashed pt-5">
+              <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                <div className="inline-flex items-center gap-2">
+                  <Filter className="h-4 w-4 text-primary" />
+                  <h3 className="text-sm font-semibold">Individual Contact Filter</h3>
+                </div>
+                <button
+                  onClick={() => syncContactsMutation.mutate()}
+                  disabled={syncContactsMutation.isPending}
+                  className="btn-secondary px-3 py-2 text-xs"
+                >
+                  {syncContactsMutation.isPending ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <RefreshCw className="h-3.5 w-3.5" />
+                  )}
+                  Sync Contacts
+                </button>
+              </div>
+
+              <p className="mb-3 text-xs text-muted-foreground">
+                `Only` = run workspace only for selected persons. `Except` = run for everyone except selected persons.
+              </p>
+
+              <div className="mb-4 flex flex-wrap gap-2">
+                {(["all", "only", "except"] as const).map((mode) => (
+                  <button
+                    key={mode}
+                    onClick={() => patchDraft({ contact_filter_mode: mode })}
+                    className={cn(
+                      "rounded-xl border px-3 py-2 text-xs font-semibold capitalize",
+                      (formData.contact_filter_mode || "all") === mode
+                        ? "border-primary/40 bg-primary/5 text-primary"
+                        : "bg-white text-muted-foreground hover:bg-secondary"
+                    )}
+                  >
+                    {mode}
+                  </button>
+                ))}
+              </div>
+
+              <div className="mb-3 flex flex-wrap gap-2">
+                <input
+                  value={manualContactInput}
+                  onChange={(event) => setManualContactInput(event.target.value)}
+                  placeholder="Add phone or JID (e.g. 91810... or 91810...@s.whatsapp.net)"
+                  className="input-base min-w-[280px] flex-1"
+                />
+                <button onClick={addManualContact} className="btn-secondary px-3 py-2 text-xs">
+                  <Plus className="h-3.5 w-3.5" />
+                  Add Contact
+                </button>
+              </div>
+
+              <div className="mb-4 flex flex-wrap gap-2">
+                <div className="relative min-w-[280px] flex-1">
+                  <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+                  <input
+                    value={contactSearchTerm}
+                    onChange={(event) => setContactSearchTerm(event.target.value)}
+                    placeholder="Search by name, phone, lid, id, or chat id"
+                    className="input-base pl-9"
+                  />
+                </div>
+                {contactSearchTerm.trim() && (
+                  <button onClick={() => setContactSearchTerm("")} className="btn-secondary px-3 py-2 text-xs">
+                    Clear Search
+                  </button>
+                )}
+              </div>
+
+              <div className="mb-4 flex items-center gap-2">
+                <input
+                  id="only-complete-contacts"
+                  type="checkbox"
+                  checked={showOnlyCompleteContacts}
+                  onChange={(event) => setShowOnlyCompleteContacts(event.target.checked)}
+                  className="h-4 w-4 rounded border-slate-300 text-primary focus:ring-primary"
+                />
+                <label htmlFor="only-complete-contacts" className="text-xs text-muted-foreground">
+                  Show only complete contacts (name + phone or @c.us id)
+                </label>
+              </div>
+
+              {formData.contact_chat_ids && formData.contact_chat_ids.length > 0 && (
+                <div className="mb-4 flex flex-wrap gap-2">
+                  {formData.contact_chat_ids.map((chatId) => (
+                    <span key={chatId} className="tag border-slate-200 bg-slate-50 text-slate-700">
+                      {chatId}
+                      <button
+                        onClick={() => removeManualContact(chatId)}
+                        className="ml-1 rounded p-0.5 hover:bg-slate-200"
+                        aria-label={`remove ${chatId}`}
+                      >
+                        <X className="h-3 w-3" />
+                      </button>
+                    </span>
+                  ))}
+                </div>
+              )}
+
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                {filteredContacts.map((contact: Contact) => {
+                  const selected = (formData.contact_chat_ids || []).includes(contact.chat_id);
+                  const primaryName =
+                    contact.display_name ||
+                    contact.phone_number ||
+                    contact.phone_jid ||
+                    contact.waha_contact_id ||
+                    contact.lid ||
+                    contact.chat_id;
+                  return (
+                    <button
+                      key={contact.id}
+                      onClick={() => toggleContactSelection(contact.chat_id)}
+                      className={cn(
+                        "rounded-xl border p-3 text-left transition-colors",
+                        selected ? "border-primary/40 bg-primary/5" : "bg-white hover:bg-secondary"
+                      )}
+                    >
+                      <div className="inline-flex items-center gap-2 text-sm font-semibold">
+                        {selected ? (
+                          <CheckCircle2 className="h-4 w-4 text-primary" />
+                        ) : (
+                          <Users className="h-4 w-4 text-muted-foreground" />
+                        )}
+                        <span className="truncate">{primaryName}</span>
+                      </div>
+                      <p className="mt-1 truncate text-xs text-muted-foreground">chat: {contact.chat_id}</p>
+                      {contact.phone_jid && <p className="truncate text-[11px] text-muted-foreground">phone: {contact.phone_jid}</p>}
+                      {contact.lid && <p className="truncate text-[11px] text-muted-foreground">lid: {contact.lid}</p>}
+                      {contact.waha_contact_id && (
+                        <p className="truncate text-[11px] text-muted-foreground">id: {contact.waha_contact_id}</p>
+                      )}
+                      <p className="mt-1 text-[11px] text-muted-foreground">
+                        {contact.source} {contact.last_seen_at ? `• seen ${new Date(contact.last_seen_at).toLocaleString()}` : ""}
+                      </p>
+                    </button>
+                  );
+                })}
+              </div>
+              {contacts.length === 0 && (
+                <p className="mt-3 text-xs text-muted-foreground">
+                  No contacts synced yet. Click `Sync Contacts` or wait for incoming messages.
+                </p>
+              )}
+              {contacts.length > 0 && filteredContacts.length === 0 && (
+                <p className="mt-3 text-xs text-muted-foreground">
+                  No contacts match your search.
+                </p>
+              )}
             </div>
           </article>
         </section>
