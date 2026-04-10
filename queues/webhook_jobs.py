@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import re
 from datetime import datetime
 from typing import Any, Dict, List, Set
 from sqlmodel import select
@@ -18,50 +17,21 @@ from database.db import SessionLocal
 from flow_engine import flow_engine
 from workspace_engine import workspace_engine
 from conversation_manager import conversation_manager
+from contact_identity import (
+    normalize_contact_chat_id,
+    extract_sender_id_candidates,
+    choose_preferred_contact_id,
+)
+from workspace_contact_filter import workspace_sender_allowed
 
 
 logger = logging.getLogger(__name__)
-
-CONTACT_FILTER_MODES = {"all", "only", "except"}
-
-
-def _normalize_contact_chat_id(value: Any) -> str:
-    raw = str(value or "").strip()
-    if not raw:
-        return ""
-    if "@" in raw:
-        return raw.lower()
-    digits = re.sub(r"\D", "", raw)
-    if len(digits) < 8:
-        return ""
-    return f"{digits}@s.whatsapp.net"
-
-
-def _extract_sender_id_candidates(payload: Dict[str, Any], chat_id: str) -> Set[str]:
-    candidates: Set[str] = set()
-    raw_values: List[Any] = [
-        payload.get("participant"),
-        payload.get("author"),
-        payload.get("_data", {}).get("key", {}).get("participant"),
-        payload.get("_data", {}).get("key", {}).get("participantAlt"),
-        payload.get("from"),
-        chat_id,
-    ]
-    for value in raw_values:
-        normalized = _normalize_contact_chat_id(value)
-        if not normalized:
-            continue
-        if "@g.us" in normalized:
-            continue
-        candidates.add(normalized)
-    return candidates
-
 
 def _upsert_sender_contacts(db, sender_ids: Set[str], display_name: str) -> None:
     now = datetime.now()
     normalized_sender_ids = {
         normalized
-        for normalized in (_normalize_contact_chat_id(value) for value in sender_ids)
+        for normalized in (normalize_contact_chat_id(value) for value in sender_ids)
         if normalized and "@g.us" not in normalized
     }
     if not normalized_sender_ids:
@@ -73,7 +43,7 @@ def _upsert_sender_contacts(db, sender_ids: Set[str], display_name: str) -> None
     c_us_value = next((sid for sid in normalized_sender_ids if sid.endswith("@c.us")), None)
     canonical_chat_id = lid_value or phone_jid_value or c_us_value or sorted(normalized_sender_ids)[0]
     phone_source = phone_jid_value or canonical_chat_id
-    phone_digits = re.sub(r"\D", "", str(phone_source).split("@", 1)[0])
+    phone_digits = "".join(ch for ch in str(phone_source).split("@", 1)[0] if ch.isdigit())
 
     lookup_conditions = [
         WhatsAppContactSQLModel.chat_id.in_(normalized_sender_ids),
@@ -130,20 +100,18 @@ def _canonical_contact_chat_id(contact: WhatsAppContactSQLModel) -> str:
     Resolve a stable canonical id for WhatsApp memory usage.
     Preference order: lid > phone_jid > waha_contact_id > chat_id.
     """
-    for raw_value in (contact.lid, contact.phone_jid, contact.waha_contact_id, contact.chat_id):
-        normalized = _normalize_contact_chat_id(raw_value)
-        if normalized and "@g.us" not in normalized:
-            return normalized
-    return ""
+    return choose_preferred_contact_id(
+        (contact.lid, contact.phone_jid, contact.waha_contact_id, contact.chat_id)
+    )
 
 
 def _resolve_canonical_sender_id(db, sender_ids: Set[str], fallback_client_id: str) -> str:
     normalized_sender_ids = {
         normalized
-        for normalized in (_normalize_contact_chat_id(value) for value in sender_ids)
+        for normalized in (normalize_contact_chat_id(value) for value in sender_ids)
         if normalized and "@g.us" not in normalized
     }
-    normalized_fallback = _normalize_contact_chat_id(fallback_client_id)
+    normalized_fallback = normalize_contact_chat_id(fallback_client_id)
     if normalized_fallback and "@g.us" not in normalized_fallback:
         normalized_sender_ids.add(normalized_fallback)
 
@@ -164,10 +132,10 @@ def _resolve_canonical_sender_id(db, sender_ids: Set[str], fallback_client_id: s
             best_contact = max(
                 rows,
                 key=lambda contact: (
-                    int(bool(_normalize_contact_chat_id(contact.lid))),
-                    int(bool(_normalize_contact_chat_id(contact.phone_jid))),
-                    int(bool(_normalize_contact_chat_id(contact.waha_contact_id))),
-                    int(bool(_normalize_contact_chat_id(contact.chat_id))),
+                    int(bool(normalize_contact_chat_id(contact.lid))),
+                    int(bool(normalize_contact_chat_id(contact.phone_jid))),
+                    int(bool(normalize_contact_chat_id(contact.waha_contact_id))),
+                    int(bool(normalize_contact_chat_id(contact.chat_id))),
                     contact.last_seen_at or datetime.min,
                     contact.updated_at or datetime.min,
                     contact.created_at or datetime.min,
@@ -177,13 +145,9 @@ def _resolve_canonical_sender_id(db, sender_ids: Set[str], fallback_client_id: s
             if canonical:
                 return canonical
 
-    ordered_candidates = sorted(normalized_sender_ids)
-    for suffix in ("@lid", "@s.whatsapp.net", "@c.us"):
-        match = next((item for item in ordered_candidates if item.endswith(suffix)), "")
-        if match:
-            return match
-    if ordered_candidates:
-        return ordered_candidates[0]
+    fallback_selected = choose_preferred_contact_id(normalized_sender_ids)
+    if fallback_selected:
+        return fallback_selected
     return normalized_fallback or str(fallback_client_id or "").strip()
 
 
@@ -205,25 +169,19 @@ def _workspace_contact_filters(db, workspace_ids: List[Any]) -> Dict[Any, Set[st
     for workspace_id, chat_id, lid, phone_jid, waha_contact_id in rows:
         bucket = mapping.setdefault(workspace_id, set())
         for raw in (chat_id, lid, phone_jid, waha_contact_id):
-            normalized = _normalize_contact_chat_id(raw)
+            normalized = normalize_contact_chat_id(raw)
             if normalized and "@g.us" not in normalized:
                 bucket.add(normalized)
     return mapping
 
 
 def _workspace_sender_allowed(workspace: Any, sender_ids: Set[str], allowed_map: Dict[Any, Set[str]]) -> bool:
-    mode = str(getattr(workspace, "contact_filter_mode", "all") or "all").strip().lower()
-    if mode not in CONTACT_FILTER_MODES:
-        mode = "all"
-
     allowed_ids = allowed_map.get(workspace.id, set())
-    has_match = any(sender_id in allowed_ids for sender_id in sender_ids)
-
-    if mode == "only":
-        return has_match
-    if mode == "except":
-        return not has_match
-    return True
+    return workspace_sender_allowed(
+        mode=getattr(workspace, "contact_filter_mode", "all"),
+        sender_ids=sender_ids,
+        allowed_ids=allowed_ids,
+    )
 
 
 def _active_direct_chat_workspaces(db) -> List[Any]:
@@ -273,7 +231,7 @@ def process_whatsapp_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     chat_id = payload.get("chatId") or payload.get("from")
     history_client_id = _resolve_history_client_id(payload, chat_id)
-    sender_ids = _extract_sender_id_candidates(payload, chat_id)
+    sender_ids = extract_sender_id_candidates(payload, chat_id)
     sender_display_name = (
         payload.get("_data", {}).get("pushName")
         or payload.get("pushName")

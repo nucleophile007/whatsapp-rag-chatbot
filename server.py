@@ -58,6 +58,11 @@ from rag_utils import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_CHUNK_OVERLAP,
 )
+from contact_identity import normalize_contact_chat_id
+from api.routers.contacts import build_contacts_router
+from api.routers.memory import build_memory_router
+from api.routers.rag import build_rag_router
+from api.routers.workspaces import build_workspaces_router
 
 # ============================================================================
 # FLOW TEMPLATES LIBRARY
@@ -907,7 +912,6 @@ def clear_conversation(client_id: str):
     return {"status": "cleared", "client_id": client_id}
 
 
-@app.get("/api/memory/{client_id}")
 def get_memory_debug_snapshot(
     client_id: str,
     query: Optional[str] = Query(default=""),
@@ -931,7 +935,6 @@ def get_memory_debug_snapshot(
     return {"status": "success", **snapshot}
 
 
-@app.patch("/api/memory/{client_id}/ltm")
 def upsert_memory_ltm(
     client_id: str,
     payload: MemoryLTMUpdate,
@@ -987,7 +990,6 @@ def upsert_memory_ltm(
     }
 
 
-@app.delete("/api/memory/{client_id}/ltm")
 def deactivate_memory_ltm(
     client_id: str,
     memory_key: str = Query(..., min_length=1, max_length=160),
@@ -1010,7 +1012,6 @@ def deactivate_memory_ltm(
     }
 
 
-@app.delete("/api/memory/{client_id}")
 def clear_memory_for_client(
     client_id: str,
     workspace_id: Optional[str] = Query(default=None),
@@ -1030,7 +1031,6 @@ def clear_memory_for_client(
     }
 
 
-@app.post("/api/rag/evaluate")
 def evaluate_rag_quality(payload: RAGEvalRequest, db: Session = Depends(get_db_session)):
     """Run a lightweight grounded-RAG evaluation set and return aggregated metrics."""
     collection_name = (payload.collection_name or "").strip()
@@ -1161,7 +1161,6 @@ def evaluate_rag_quality(payload: RAGEvalRequest, db: Session = Depends(get_db_s
     }
 
 
-@app.get("/api/rag/scorecards")
 def list_rag_scorecards(
     collection_name: Optional[str] = Query(default=None),
     limit: int = Query(default=20, ge=1, le=200),
@@ -1193,7 +1192,6 @@ def list_rag_scorecards(
     }
 
 
-@app.get("/api/rag/scorecards/{scorecard_id}")
 def get_rag_scorecard(scorecard_id: str, db: Session = Depends(get_db_session)):
     try:
         scorecard_uuid = uuid.UUID(scorecard_id)
@@ -1264,16 +1262,7 @@ _CONTACT_FILTER_MODES = {"all", "only", "except"}
 
 
 def _normalize_contact_chat_id(value: Any) -> str:
-    raw = str(value or "").strip()
-    if not raw:
-        return ""
-    if "@" in raw:
-        return raw.lower()
-
-    digits = re.sub(r"\D", "", raw)
-    if len(digits) < 8:
-        return ""
-    return f"{digits}@s.whatsapp.net"
+    return normalize_contact_chat_id(value)
 
 
 def _extract_phone_number(chat_id: str) -> str:
@@ -1383,43 +1372,6 @@ def _serialize_contact_ref(contact: WhatsAppContactSQLModel) -> Dict[str, Any]:
         "is_active": bool(contact.is_active),
         "last_seen_at": contact.last_seen_at.isoformat() if contact.last_seen_at else None,
     }
-
-
-def _resolve_whatsapp_client_id(payload: Dict[str, Any]) -> str:
-    """Resolve conversation key per sender (participant) instead of group chat id."""
-    candidates = [
-        payload.get("participant"),
-        payload.get("author"),
-        payload.get("_data", {}).get("key", {}).get("participant"),
-        payload.get("_data", {}).get("key", {}).get("participantAlt"),
-        payload.get("from"),
-        payload.get("chatId"),
-    ]
-    for candidate in candidates:
-        value = str(candidate or "").strip()
-        if value:
-            return value
-    return ""
-
-
-def _should_ingest_conversation_message(payload: Dict[str, Any]) -> bool:
-    history_client_id = _resolve_whatsapp_client_id(payload)
-    body = str(payload.get("body") or "").strip()
-    from_me = bool(payload.get("fromMe"))
-    message_id = (payload.get("message_id") or payload.get("id") or "").strip()
-    if not history_client_id or not body or from_me:
-        return False
-
-    dedupe_ttl = max(0, int(os.getenv("WEBHOOK_DEDUP_TTL_SECONDS", "600")))
-    if dedupe_ttl <= 0 or not message_id:
-        return True
-
-    dedupe_key = f"conversation:ingress:{message_id}"
-    try:
-        inserted = queue.connection.set(dedupe_key, "1", ex=dedupe_ttl, nx=True)
-        return bool(inserted)
-    except Exception:
-        return True
 
 
 def _cleanup_stale_flow_executions(db: Session, stale_before: datetime) -> int:
@@ -2367,13 +2319,10 @@ class WorkspaceCreate(BaseModel):
 class WorkspaceStatusUpdate(BaseModel):
     is_active: bool
 
-@app.get("/api/workspaces")
 def get_workspaces(db: Session = Depends(get_db_session)):
     """Saare workspaces ki list nikaalte hain"""
     ensure_workspace_flow_schema(db)
-    normalized = _normalize_contact_primary_chat_ids(db)
-    if any(int(normalized.get(key, 0)) > 0 for key in ("deduped", "promoted", "merged_conflicts")):
-        db.commit()
+    _normalize_contacts_if_needed(db)
     workspaces = db.execute(select(WorkspaceSQLModel)).scalars().all()
     knowledge_base_ids = [ws.knowledge_base_id for ws in workspaces if ws.knowledge_base_id]
     kb_by_id = {}
@@ -2411,7 +2360,6 @@ def get_workspaces(db: Session = Depends(get_db_session)):
         })
     return {"workspaces": result}
 
-@app.post("/api/workspaces")
 def create_workspace(data: WorkspaceCreate, db: Session = Depends(get_db_session)):
     """Create a new workspace and assign groups"""
     ensure_workspace_flow_schema(db)
@@ -2438,23 +2386,20 @@ def create_workspace(data: WorkspaceCreate, db: Session = Depends(get_db_session
     db.refresh(ws)
     return ws
 
-@app.get("/api/workspaces/{workspace_id}")
 def get_workspace(workspace_id: uuid.UUID, db: Session = Depends(get_db_session)):
     """Get a specific workspace with full details"""
     ensure_workspace_flow_schema(db)
-    normalized = _normalize_contact_primary_chat_ids(db)
-    if any(int(normalized.get(key, 0)) > 0 for key in ("deduped", "promoted", "merged_conflicts")):
-        db.commit()
-    print(f"DEBUG: >>> Hit GET /api/workspaces/[{workspace_id}] <<<")
+    _normalize_contacts_if_needed(db)
+    logger.debug("GET /api/workspaces/%s", workspace_id)
     ws = db.execute(
         select(WorkspaceSQLModel).where(WorkspaceSQLModel.id == workspace_id)
     ).scalars().first()
     
     if not ws:
-        print(f"DEBUG: >>> Workspace [{workspace_id}] NOT found in DB <<<")
+        logger.debug("Workspace not found: %s", workspace_id)
         raise HTTPException(status_code=404, detail="Workspace not found")
         
-    print(f"DEBUG: Found workspace {ws.name}")
+    logger.debug("Workspace found: %s", ws.name)
     # Get assigned groups
     groups = db.execute(
         select(WhatsAppGroupSQLModel)
@@ -2480,10 +2425,9 @@ def get_workspace(workspace_id: uuid.UUID, db: Session = Depends(get_db_session)
         "contacts": [_serialize_contact_ref(contact) for contact in contacts],
     }
 
-@app.put("/api/workspaces/{workspace_id}")
 def update_workspace(workspace_id: uuid.UUID, data: WorkspaceCreate, db: Session = Depends(get_db_session)):
     """Update an existing workspace"""
-    print(f"DEBUG: Hit PUT /api/workspaces/{workspace_id}")
+    logger.debug("PUT /api/workspaces/%s", workspace_id)
     ensure_workspace_flow_schema(db)
     ws = db.execute(
         select(WorkspaceSQLModel).where(WorkspaceSQLModel.id == workspace_id)
@@ -2510,13 +2454,12 @@ def update_workspace(workspace_id: uuid.UUID, data: WorkspaceCreate, db: Session
     _assign_workspace_contacts(db, ws.id, data.contact_chat_ids)
         
     db.commit()
-    print(f"DEBUG: Updated workspace {ws.name}")
+    logger.debug("Workspace updated: %s", ws.name)
     return {"status": "success", "message": "Workspace updated"}
 
-@app.delete("/api/workspaces/{workspace_id}")
 def delete_workspace(workspace_id: uuid.UUID, db: Session = Depends(get_db_session)):
     """Delete a workspace and its group assignments"""
-    print(f"DEBUG: Hit DELETE /api/workspaces/{workspace_id}")
+    logger.debug("DELETE /api/workspaces/%s", workspace_id)
     ensure_workspace_flow_schema(db)
     ws = db.execute(
         select(WorkspaceSQLModel).where(WorkspaceSQLModel.id == workspace_id)
@@ -2547,7 +2490,7 @@ def delete_workspace(workspace_id: uuid.UUID, db: Session = Depends(get_db_sessi
     
     db.delete(ws)
     db.commit()
-    print(f"DEBUG: Deleted workspace {workspace_id}")
+    logger.debug("Workspace deleted: %s", workspace_id)
     return {"status": "success", "message": "Workspace deleted"}
 
 
@@ -2817,6 +2760,13 @@ def _normalize_contact_primary_chat_ids(db: Session) -> Dict[str, int]:
     }
 
 
+def _normalize_contacts_if_needed(db: Session) -> Dict[str, int]:
+    normalized = _normalize_contact_primary_chat_ids(db)
+    if any(int(normalized.get(key, 0)) > 0 for key in ("deduped", "promoted", "merged_conflicts")):
+        db.commit()
+    return normalized
+
+
 def _dedupe_whatsapp_contacts(db: Session) -> int:
     """
     Merge duplicate contacts representing the same person across
@@ -2898,13 +2848,10 @@ def _dedupe_whatsapp_contacts(db: Session) -> int:
     return int(merged_count)
 
 
-@app.get("/api/contacts")
 def get_contacts(db: Session = Depends(get_db_session)):
     """Get known individual contacts (not groups)."""
     ensure_workspace_flow_schema(db)
-    normalized = _normalize_contact_primary_chat_ids(db)
-    if any(int(normalized.get(key, 0)) > 0 for key in ("deduped", "promoted", "merged_conflicts")):
-        db.commit()
+    _normalize_contacts_if_needed(db)
     contacts = db.execute(
         select(WhatsAppContactSQLModel)
         .where(~WhatsAppContactSQLModel.chat_id.like("%@g.us"))
@@ -2916,7 +2863,6 @@ def get_contacts(db: Session = Depends(get_db_session)):
     }
 
 
-@app.post("/api/contacts/sync")
 def sync_contacts(
     allow_fallback: bool = Query(default=False),
     db: Session = Depends(get_db_session),
@@ -2936,7 +2882,7 @@ def sync_contacts(
             source = "waha_only_no_fallback"
             fallback_reason = "WAHA returned 0 contacts; fallback disabled"
 
-    normalized = _normalize_contact_primary_chat_ids(db)
+    normalized = _normalize_contacts_if_needed(db)
     db.commit()
     contacts = db.execute(
         select(WhatsAppContactSQLModel).where(~WhatsAppContactSQLModel.chat_id.like("%@g.us"))
@@ -3325,7 +3271,6 @@ def update_flow(flow_id: str, flow_data: FlowUpdate, db: Session = Depends(get_d
     return {"status": "success", "flow_id": str(flow.id)}
 
 
-@app.post("/api/workspaces/{workspace_id}/flows/{flow_id}")
 def attach_workspace_flow(workspace_id: str, flow_id: str, db: Session = Depends(get_db_session)):
     """Attach a reusable logic layer to a workspace."""
     ensure_workspace_flow_schema(db)
@@ -3355,7 +3300,6 @@ def attach_workspace_flow(workspace_id: str, flow_id: str, db: Session = Depends
     }
 
 
-@app.delete("/api/workspaces/{workspace_id}/flows/{flow_id}")
 def detach_workspace_flow(workspace_id: str, flow_id: str, db: Session = Depends(get_db_session)):
     """Detach a logic layer from one workspace only."""
     ensure_workspace_flow_schema(db)
@@ -3554,7 +3498,6 @@ async def test_flow(flow_id: str, db: Session = Depends(get_db_session)):
         print(f"❌ Test flow failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.patch("/api/workspaces/{workspace_id}/toggle")
 def toggle_workspace(workspace_id: str, db: Session = Depends(get_db_session)):
     """Toggle workspace active status"""
     try:
@@ -3581,7 +3524,6 @@ def toggle_workspace(workspace_id: str, db: Session = Depends(get_db_session)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.patch("/api/workspaces/{workspace_id}/status")
 def set_workspace_status(workspace_id: str, data: WorkspaceStatusUpdate, db: Session = Depends(get_db_session)):
     """Set workspace active status explicitly to avoid accidental inverse toggles."""
     try:
@@ -3608,7 +3550,6 @@ def set_workspace_status(workspace_id: str, data: WorkspaceStatusUpdate, db: Ses
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/workspaces/{workspace_id}/status/set")
 def set_workspace_status_get(
     workspace_id: str,
     is_active: str = Query(...),
@@ -3651,3 +3592,45 @@ def set_workspace_status_get(
         db.rollback()
         print(f"❌ Error setting workspace status via GET fallback: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# Feature routers (endpoint declarations) keep server.py smaller while handlers remain local.
+app.include_router(
+    build_memory_router(
+        get_memory_debug_snapshot_handler=get_memory_debug_snapshot,
+        upsert_memory_ltm_handler=upsert_memory_ltm,
+        deactivate_memory_ltm_handler=deactivate_memory_ltm,
+        clear_memory_for_client_handler=clear_memory_for_client,
+        memory_ltm_update_model=MemoryLTMUpdate,
+    )
+)
+app.include_router(
+    build_rag_router(
+        evaluate_rag_quality_handler=evaluate_rag_quality,
+        list_rag_scorecards_handler=list_rag_scorecards,
+        get_rag_scorecard_handler=get_rag_scorecard,
+        rag_eval_request_model=RAGEvalRequest,
+    )
+)
+app.include_router(
+    build_contacts_router(
+        get_contacts_handler=get_contacts,
+        sync_contacts_handler=sync_contacts,
+    )
+)
+app.include_router(
+    build_workspaces_router(
+        get_workspaces_handler=get_workspaces,
+        create_workspace_handler=create_workspace,
+        get_workspace_handler=get_workspace,
+        update_workspace_handler=update_workspace,
+        delete_workspace_handler=delete_workspace,
+        attach_workspace_flow_handler=attach_workspace_flow,
+        detach_workspace_flow_handler=detach_workspace_flow,
+        toggle_workspace_handler=toggle_workspace,
+        set_workspace_status_handler=set_workspace_status,
+        set_workspace_status_get_handler=set_workspace_status_get,
+        workspace_create_model=WorkspaceCreate,
+        workspace_status_update_model=WorkspaceStatusUpdate,
+    )
+)
