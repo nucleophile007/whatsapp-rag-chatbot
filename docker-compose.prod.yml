@@ -1,0 +1,157 @@
+services:
+  valkey:
+    image: valkey/valkey:latest
+    container_name: valkey
+    restart: unless-stopped
+    networks:
+      - async_rag_network
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-whatsapp_flows}
+      POSTGRES_USER: ${POSTGRES_USER:-flowbuilder}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    networks:
+      - async_rag_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-flowbuilder} -d ${POSTGRES_DB:-whatsapp_flows}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    restart: unless-stopped
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    networks:
+      - async_rag_network
+
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: async_rag_server
+    restart: unless-stopped
+    ports:
+      - "${SERVER_PORT:-8000}:8000"
+    environment:
+      REDIS_HOST: valkey
+      REDIS_PORT: 6379
+      QDRANT_URL: http://qdrant:6333
+      WAHA_URL: http://waha:3000
+      WAHA_SESSION: ${WAHA_SESSION:-default}
+      WAHA_API_KEY: ${WAHA_API_KEY:?WAHA_API_KEY is required}
+      WAHA_WEBHOOK_URL: http://server:8000/whatsapp/webhook?waha_instance=${WAHA_SESSION:-default}
+      WAHA_INSTANCE_MAP: ${WAHA_INSTANCE_MAP:-{"default":{"url":"http://waha:3000","session":"default"}}}
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
+      RAG_GROUNDING_THRESHOLD: ${RAG_GROUNDING_THRESHOLD:-0.46}
+      RAG_FINAL_CONTEXT_K: ${RAG_FINAL_CONTEXT_K:-8}
+      RAG_RETRIEVAL_CANDIDATES: ${RAG_RETRIEVAL_CANDIDATES:-22}
+      RAG_REQUIRE_CITATIONS: ${RAG_REQUIRE_CITATIONS:-false}
+      CONVERSATION_MEMORY_SCOPE: ${CONVERSATION_MEMORY_SCOPE:-client_workspace}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:?GOOGLE_API_KEY is required}
+    depends_on:
+      - valkey
+      - qdrant
+      - postgres
+    networks:
+      - async_rag_network
+    command: uvicorn server:app --host 0.0.0.0 --port 8000
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: async_rag_worker
+    restart: unless-stopped
+    environment:
+      REDIS_HOST: valkey
+      REDIS_PORT: 6379
+      QDRANT_URL: http://qdrant:6333
+      SERVER_URL: http://async_rag_server:8000
+      OBJC_DISABLE_INITIALIZE_FORK_SAFETY: "YES"
+      WAHA_URL: http://waha:3000
+      WAHA_SESSION: ${WAHA_SESSION:-default}
+      WAHA_API_KEY: ${WAHA_API_KEY:?WAHA_API_KEY is required}
+      WAHA_INSTANCE_MAP: ${WAHA_INSTANCE_MAP:-{"default":{"url":"http://waha:3000","session":"default"}}}
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
+      RQ_WORKER_DEFAULT_COUNT: ${RQ_WORKER_DEFAULT_COUNT:-1}
+      RQ_WORKER_MIN_COUNT: ${RQ_WORKER_MIN_COUNT:-1}
+      RQ_WORKER_MAX_COUNT: ${RQ_WORKER_MAX_COUNT:-16}
+      RQ_WORKER_DESIRED_KEY: rq:workers:desired_count
+      RQ_WORKER_MANAGER_HEARTBEAT_KEY: rq:workers:manager:heartbeat
+      RQ_WORKER_MANAGER_HEARTBEAT_TTL_SECONDS: ${RQ_WORKER_MANAGER_HEARTBEAT_TTL_SECONDS:-15}
+      RAG_GROUNDING_THRESHOLD: ${RAG_GROUNDING_THRESHOLD:-0.46}
+      RAG_FINAL_CONTEXT_K: ${RAG_FINAL_CONTEXT_K:-8}
+      RAG_RETRIEVAL_CANDIDATES: ${RAG_RETRIEVAL_CANDIDATES:-22}
+      RAG_REQUIRE_CITATIONS: ${RAG_REQUIRE_CITATIONS:-false}
+      CONVERSATION_MEMORY_SCOPE: ${CONVERSATION_MEMORY_SCOPE:-client_workspace}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:?GOOGLE_API_KEY is required}
+    depends_on:
+      - valkey
+      - qdrant
+      - waha
+      - postgres
+    networks:
+      - async_rag_network
+    command: python queues/worker_pool_manager.py
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: async_rag_frontend
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT:-5172}:5173"
+    environment:
+      VITE_PROXY_TARGET: http://server:8000
+    depends_on:
+      - server
+    networks:
+      - async_rag_network
+      - cloudflare-net
+
+  waha:
+    image: devlikeapro/waha:latest
+    platform: linux/amd64
+    container_name: waha
+    restart: unless-stopped
+    ports:
+      - "${WAHA_PORT:-3000}:3000"
+    environment:
+      WAHA_API_KEY: ${WAHA_API_KEY:?WAHA_API_KEY is required}
+      WHATSAPP_DEFAULT_ENGINE: NOWEB
+      WAHA_WEBHOOK_URL: http://server:8000/whatsapp/webhook?waha_instance=${WAHA_SESSION:-default}
+      WAHA_DASHBOARD_USERNAME: ${WAHA_DASHBOARD_USERNAME:-admin}
+      WAHA_DASHBOARD_PASSWORD: ${WAHA_DASHBOARD_PASSWORD:?WAHA_DASHBOARD_PASSWORD is required}
+      WHATSAPP_SWAGGER_USERNAME: ${WHATSAPP_SWAGGER_USERNAME:-admin}
+      WHATSAPP_SWAGGER_PASSWORD: ${WHATSAPP_SWAGGER_PASSWORD:?WHATSAPP_SWAGGER_PASSWORD is required}
+    volumes:
+      - ./sessions:/app/.sessions
+    networks:
+      - async_rag_network
+      - cloudflare-net
+
+networks:
+  async_rag_network:
+    driver: bridge
+  cloudflare-net:
+    external: true
+
+volumes:
+  qdrant_storage:
+  postgres_data:
