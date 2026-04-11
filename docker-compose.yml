@@ -41,11 +41,9 @@ services:
       - "5172:5173"
     environment:
       - VITE_PROXY_TARGET=http://server:8000
-    volumes:
-      - ./frontend:/app
-      - /app/node_modules
     networks:
       - async_rag_network
+      - cloudflare-net
     depends_on:
       - server
 
@@ -157,6 +155,7 @@ services:
       - ./sessions:/app/.sessions
     networks:
       - async_rag_network
+      - cloudflare-net
 
   # waha2:
   #   image: devlikeapro/waha:latest
@@ -180,6 +179,8 @@ services:
 networks:
   async_rag_network:
     driver: bridge
+  cloudflare-net:
+    external: true
 
 volumes:
   qdrant_storage:
